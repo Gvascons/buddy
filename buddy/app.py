@@ -332,38 +332,45 @@ class BuddyApp:
         GLib.idle_add(show)
 
     def _handle_response(self, parsed, captures) -> bool:
-        """Main thread: start cursor flight + kick TTS worker."""
+        """Main thread: kick the TTS worker. The cursor flight is
+        scheduled for the moment the first audio sample is about to
+        play, via the on_started callback — so with Kokoro's ~2s
+        first-audio latency the cursor and the voice stay in sync.
+        """
         if self.control_panel:
             self.control_panel.set_response(parsed.spoken_text)
 
-        # Cursor flight
+        # Pre-resolve the overlay target so the on_started callback
+        # doesn't have to do any cross-thread work besides calling
+        # overlay.fly_to().
+        target = None
         if parsed.has_coordinate and self.overlay is not None:
-            self.overlay.show()
             target = coords.resolve_point(
                 parsed,
                 captures,
                 overlay_origin_x=self.overlay.origin_x,
                 overlay_origin_y=self.overlay.origin_y,
             )
-            if target is not None:
-                self.overlay.fly_to(
-                    target.overlay_x,
-                    target.overlay_y,
-                    label=parsed.label,
-                )
+            # Show the overlay window early so fly_to() doesn't have
+            # to wait for it to map when audio starts.
+            self.overlay.show()
 
-        # TTS on a worker thread
+        # TTS on a worker thread — the on_started callback fires on
+        # that worker thread the moment the first audio sample is
+        # about to be written to the output device. We marshal it
+        # back to the main thread, which is where we start the
+        # cursor flight and flip the state machine to RESPONDING.
         threading.Thread(
             target=self._tts_worker,
-            args=(parsed.spoken_text,),
+            args=(parsed.spoken_text, target, parsed.label),
             daemon=True,
             name="buddy-tts",
         ).start()
         return False
 
-    def _tts_worker(self, text: str) -> None:
+    def _tts_worker(self, text: str, target, label: str | None) -> None:
         def on_started() -> None:
-            GLib.idle_add(self._mark_responding)
+            GLib.idle_add(self._audio_starting, target, label)
 
         try:
             self.tts.speak(text, on_started=on_started)
@@ -372,9 +379,21 @@ class BuddyApp:
         finally:
             GLib.idle_add(self._tts_finished)
 
-    def _mark_responding(self) -> bool:
+    def _audio_starting(self, target, label: str | None) -> bool:
+        """Main thread: called at the moment audio actually begins.
+
+        Starts the cursor flight (so it arrives at the target while
+        the voice is still explaining it) and transitions the state
+        machine to RESPONDING.
+        """
         if self.state.state == VoiceState.PROCESSING:
             self.state.transition(VoiceState.RESPONDING)
+        if target is not None and self.overlay is not None:
+            self.overlay.fly_to(
+                target.overlay_x,
+                target.overlay_y,
+                label=label,
+            )
         return False
 
     def _tts_finished(self) -> bool:
