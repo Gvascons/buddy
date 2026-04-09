@@ -208,6 +208,9 @@ def _resize_for_claude(png_path: Path, jpg_path: Path) -> tuple[int, int]:
     is already under the cap we still re-save as JPEG to benefit from
     the smaller file size (Claude CLI seems to downsize PNG more
     aggressively than JPEG at similar absolute pixel counts).
+
+    When config.GRID_ENABLED is True, we also overlay a labeled grid
+    on the final JPEG (Set-of-Marks prompting — see _draw_som_grid).
     """
     from PIL import Image
 
@@ -226,12 +229,79 @@ def _resize_for_claude(png_path: Path, jpg_path: Path) -> tuple[int, int]:
         # JPEG wants RGB, not RGBA
         if resized.mode != "RGB":
             resized = resized.convert("RGB")
+        if config.GRID_ENABLED:
+            resized = _draw_som_grid(resized, config.GRID_ROWS, config.GRID_COLS)
         resized.save(jpg_path, "JPEG", quality=JPEG_QUALITY, optimize=True)
     try:
         png_path.unlink()
     except FileNotFoundError:
         pass
     return new_w, new_h
+
+
+def _draw_som_grid(img, rows: int, cols: int):
+    """Overlay a labeled Set-of-Marks grid on the given Pillow image.
+
+    Returns a new RGB Pillow image with thin translucent grid lines
+    and cell labels ("A1", "B1", ..., up to the Nth row and Mth column).
+    Claude's vision model is much better at identifying labeled cells
+    than at returning raw pixel coordinates, so this overlay is the
+    single biggest accuracy boost available without a round-trip
+    second Claude call.
+    """
+    from PIL import Image, ImageDraw, ImageFont
+
+    rgba = img.convert("RGBA")
+    overlay = Image.new("RGBA", rgba.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+
+    width, height = rgba.size
+    cell_w = width / cols
+    cell_h = height / rows
+
+    # Grid lines — thin, semi-transparent lime
+    line_color = (50, 255, 120, 170)
+    for r in range(1, rows):
+        y = int(round(r * cell_h))
+        draw.line([(0, y), (width, y)], fill=line_color, width=1)
+    for c in range(1, cols):
+        x = int(round(c * cell_w))
+        draw.line([(x, 0), (x, height)], fill=line_color, width=1)
+
+    # Pick a readable font. Try DejaVu first (ubuntu default), fall
+    # back to Pillow's bitmap default if not available.
+    try:
+        font = ImageFont.truetype(
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 11,
+        )
+    except (OSError, IOError):
+        try:
+            font = ImageFont.truetype("DejaVuSans-Bold.ttf", 11)
+        except (OSError, IOError):
+            font = ImageFont.load_default()
+
+    # Cell labels — top-left of each cell, with a dark backdrop so
+    # they're readable against any background.
+    label_bg = (0, 0, 0, 180)
+    label_fg = (230, 255, 230, 255)
+    for r in range(rows):
+        for c in range(cols):
+            label = f"{chr(ord('A') + c)}{r + 1}"
+            x = int(round(c * cell_w)) + 3
+            y = int(round(r * cell_h)) + 1
+            # Measure text so the backdrop is tight
+            try:
+                bbox = draw.textbbox((x, y), label, font=font)
+            except AttributeError:
+                # Older Pillow fallback
+                text_w, text_h = draw.textsize(label, font=font)  # type: ignore
+                bbox = (x, y, x + text_w, y + text_h)
+            padded = (bbox[0] - 1, bbox[1] - 1, bbox[2] + 1, bbox[3] + 1)
+            draw.rectangle(padded, fill=label_bg)
+            draw.text((x, y), label, fill=label_fg, font=font)
+
+    composited = Image.alpha_composite(rgba, overlay).convert("RGB")
+    return composited
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -402,11 +472,16 @@ def capture_active_window(
         print(f"⚠️ screenshot: resize failed: {exc}")
         return []
 
+    grid_note = (
+        f" a {config.GRID_COLS}x{config.GRID_ROWS} labeled grid is "
+        f"overlaid on this image."
+        if config.GRID_ENABLED else ""
+    )
     label = (
         f'cropped to the active application window "{window.title or "(untitled)"}" '
         f"(image dimensions: {claude_w}x{claude_h} pixels). "
-        "this is the full screenshot — there is nothing outside this crop. "
-        "POINT coordinates should be in this image's pixel space."
+        "this is the full screenshot — there is nothing outside this crop."
+        f"{grid_note}"
     )
 
     return [ScreenCapture(
@@ -489,10 +564,15 @@ def capture_all_monitors(
 
         is_cursor = (mon is cursor_mon)
         focus_note = " — cursor is on this screen (primary focus)" if is_cursor else ""
+        grid_note = (
+            f" a {config.GRID_COLS}x{config.GRID_ROWS} labeled grid is "
+            f"overlaid on this image."
+            if config.GRID_ENABLED else ""
+        )
         label = (
             f"screen {idx} of {total} ({mon.name}){focus_note} "
-            f"(image dimensions: {claude_w}x{claude_h} pixels). "
-            "POINT coordinates should be in this image's pixel space."
+            f"(image dimensions: {claude_w}x{claude_h} pixels)."
+            f"{grid_note}"
         )
         captures.append(ScreenCapture(
             image_path=str(jpg_path),

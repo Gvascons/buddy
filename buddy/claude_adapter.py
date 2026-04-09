@@ -19,13 +19,28 @@ from buddy import config
 
 
 # ────────────────────────────────────────────────────────────────────
-# POINT tag parser — regex copied verbatim from the Clicky project
-# (leanring-buddy/CompanionManager.swift, parsePointingCoordinates).
+# POINT tag parser — based on the Clicky project's regex
+# (leanring-buddy/CompanionManager.swift, parsePointingCoordinates)
+# with a Set-of-Marks cell variant added on top.
 # See https://github.com/farzaa/clicky
+#
+# Accepts three formats:
+#   [POINT:none]                         — no pointing needed
+#   [POINT:123,456:label:screen2]        — raw pixel coords (classic)
+#   [POINT:H6:label:screen2]             — grid cell name (SoM)
+# The label and screen suffix are optional in all coord variants.
 # ────────────────────────────────────────────────────────────────────
 
 POINT_REGEX = re.compile(
-    r"\[POINT:(?:none|(\d+)\s*,\s*(\d+)(?::([^\]:\s][^\]:]*?))?(?::screen(\d+))?)\]\s*$"
+    r"\[POINT:"
+    r"(?:"
+    r"none"                                      # [POINT:none]
+    r"|(?P<x>\d+)\s*,\s*(?P<y>\d+)"              # raw pixels
+    r"|(?P<cell>[A-Z]\d+)"                       # cell name, e.g. "H6"
+    r")"
+    r"(?::(?P<label>[^\]:\s][^\]:]*?))?"         # optional label
+    r"(?::screen(?P<screen>\d+))?"               # optional :screenN
+    r"\]\s*$"
 )
 
 
@@ -35,25 +50,42 @@ class ClaudeCancelled(Exception):
 
 @dataclass
 class ParsedResponse:
-    """A Claude response with the POINT tag (if any) extracted."""
+    """A Claude response with the POINT tag (if any) extracted.
+
+    At most ONE of `(point_x, point_y)` or `cell` is populated:
+    - When Claude returns pixel coordinates, point_x/point_y are set.
+    - When Claude returns a grid cell (Set-of-Marks mode), cell is set.
+    - When there's no coordinate at all (or [POINT:none]), both are
+      None and has_coordinate returns False.
+
+    coords.resolve_point() translates either form into overlay-local
+    pixel coordinates using the target ScreenCapture's dimensions.
+    """
     spoken_text: str                # response with POINT tag stripped, trimmed
-    point_x: int | None = None      # screenshot pixel x
-    point_y: int | None = None      # screenshot pixel y
+    point_x: int | None = None      # screenshot pixel x (raw-pixel mode)
+    point_y: int | None = None      # screenshot pixel y (raw-pixel mode)
+    cell: str | None = None         # grid cell label, e.g. "H6" (SoM mode)
     label: str | None = None        # short description of the element, or "none"
     screen_number: int | None = None  # 1-based; None means cursor screen
 
     @property
     def has_coordinate(self) -> bool:
+        if self.cell is not None:
+            return True
         return self.point_x is not None and self.point_y is not None
 
 
 def parse_point(response_text: str) -> ParsedResponse:
     """Extract the trailing POINT tag from a Claude response.
 
-    Returns the spoken text (tag removed, whitespace trimmed) plus the
-    parsed coordinate/label/screen fields. Responses with no tag come
-    back with all POINT fields None. `[POINT:none]` comes back with
-    coordinate None but `label="none"`, mirroring Clicky's behavior.
+    Returns the spoken text (tag removed, whitespace trimmed) plus
+    parsed coordinate fields. Supports three formats:
+
+      [POINT:none]                  → label="none", no coordinate
+      [POINT:123,456:label:screenN] → point_x/point_y set
+      [POINT:H6:label:screenN]      → cell set
+
+    Responses with no tag come back with all POINT fields None.
     """
     match = POINT_REGEX.search(response_text)
     if not match:
@@ -61,22 +93,32 @@ def parse_point(response_text: str) -> ParsedResponse:
 
     spoken = response_text[: match.start()].strip()
 
-    x_group = match.group(1)
-    y_group = match.group(2)
-    if x_group is None or y_group is None:
-        # [POINT:none]
-        return ParsedResponse(spoken_text=spoken, label="none")
+    x_group = match.group("x")
+    y_group = match.group("y")
+    cell_group = match.group("cell")
+    label_group = match.group("label")
+    screen_group = match.group("screen")
 
-    label = match.group(3).strip() if match.group(3) else None
-    screen = int(match.group(4)) if match.group(4) else None
+    label = label_group.strip() if label_group else None
+    screen = int(screen_group) if screen_group else None
 
-    return ParsedResponse(
-        spoken_text=spoken,
-        point_x=int(x_group),
-        point_y=int(y_group),
-        label=label,
-        screen_number=screen,
-    )
+    if cell_group is not None:
+        return ParsedResponse(
+            spoken_text=spoken,
+            cell=cell_group,
+            label=label,
+            screen_number=screen,
+        )
+    if x_group is not None and y_group is not None:
+        return ParsedResponse(
+            spoken_text=spoken,
+            point_x=int(x_group),
+            point_y=int(y_group),
+            label=label,
+            screen_number=screen,
+        )
+    # [POINT:none] — matched, but no coordinate capture fired
+    return ParsedResponse(spoken_text=spoken, label="none")
 
 
 # ────────────────────────────────────────────────────────────────────
