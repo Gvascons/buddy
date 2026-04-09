@@ -3,24 +3,29 @@
 A single GTK4 Gtk.Window the size of the union of all monitors. Drawn
 in Cairo. Click-through via an empty input region. Always-on-top via
 `_NET_WM_STATE_ABOVE`. Runs a 60fps tick from `GLib.timeout_add` that
-steps a quadratic Bezier flight ported line-for-line from Clicky's
-OverlayWindow.swift:495-568.
+steps a quadratic Bezier flight ported from Clicky's quadratic
+Bezier animation (OverlayWindow.swift, animateBezierFlightArc).
+
+Design note: the blue triangle is **agent-operated only**. It is
+never drawn while idle — your real mouse cursor is never shadowed.
+The triangle only appears during a flight toward a [POINT:...] tag
+Claude emitted, holds at the target with a label bubble, then fades
+out. This is different from Clicky, which keeps a "buddy" triangle
+following your cursor at all times.
 
 Usage (from the GTK main thread only):
 
     overlay = CursorOverlay(monitors)
-    overlay.show()                      # fades in, transparent
-    overlay.fly_to(x, y, label="render button",
-                   on_complete=lambda: overlay.start_pointing("render button"))
-    overlay.return_to_idle()           # cursor flies back toward mouse
-    overlay.hide()                      # for screenshot, or transient fade-out
+    overlay.show()                      # maps the window; triangle still invisible
+    overlay.fly_to(x, y, label="render button")
+    # → triangle swoops in near target, lands, shows label, fades out
+    overlay.hide()                      # for screenshot capture
 """
 
 from __future__ import annotations
 
 import enum
 import math
-import subprocess
 from typing import Callable, Sequence
 
 import gi
@@ -46,11 +51,11 @@ BUBBLE_TEXT = (1.0, 1.0, 1.0, 1.0)
 
 
 class NavMode(enum.Enum):
-    HIDDEN = "hidden"              # not visible
-    FOLLOWING_MOUSE = "following"  # idle, triangle follows the mouse
-    FLYING_TO_TARGET = "flying"    # mid-Bezier
+    HIDDEN = "hidden"              # not visible at all
+    IDLE_INVISIBLE = "idle"        # window is mapped but triangle is not drawn
+    FLYING_TO_TARGET = "flying"    # mid-Bezier, triangle visible
     POINTING_AT_TARGET = "pointing"  # at destination, bubble showing
-    RETURNING = "returning"        # flying back to the mouse
+    FADING_OUT = "fading"          # triangle + bubble fading to zero alpha
 
 
 class CursorOverlay:
@@ -124,14 +129,18 @@ class CursorOverlay:
         xlib_helpers.apply_overlay_hints(self.window, click_through=True)
 
     def show(self) -> None:
-        """Present the overlay (fades in)."""
+        """Present the overlay window but keep the triangle invisible.
+
+        The window itself must be mapped (so Cairo has a surface to
+        draw on when a flight starts) but nothing is drawn until
+        `fly_to()` is called. Your real mouse cursor is never shadowed.
+        """
         if not self.window.get_visible():
             self.window.present()
         xlib_helpers.apply_overlay_hints(self.window, click_through=True)
-        self.visible_alpha = 0.0
         if self.mode == NavMode.HIDDEN:
-            self.mode = NavMode.FOLLOWING_MOUSE
-            self._sync_cursor_to_mouse()
+            self.mode = NavMode.IDLE_INVISIBLE
+            self.visible_alpha = 0.0
         self._start_tick()
 
     def hide(self) -> None:
@@ -160,28 +169,37 @@ class CursorOverlay:
     ) -> None:
         """Begin a quadratic Bezier flight to (target_x, target_y).
 
-        Coordinates are overlay-local (same space as `cursor_x/y`).
-        `label` is displayed in the bubble once the flight completes.
+        Coordinates are overlay-local. Since the triangle is invisible
+        when idle, the flight originates from a point near the target:
+        the triangle swoops in from ~160px above-left, so you see it
+        arrive rather than teleport. `label` is displayed in the
+        bubble once the flight completes.
         """
         if self.mode == NavMode.HIDDEN:
             self.show()
 
+        # Entrance point — slightly above-left of the target so the
+        # flight has some arc, but short so it doesn't waste screen time
+        # flying across the whole desktop.
+        entry_x = target_x - 160.0
+        entry_y = target_y - 120.0
+
+        # Reset visual state
+        self.cursor_x = entry_x
+        self.cursor_y = entry_y
+        self.visible_alpha = 0.0
+
         self._begin_flight(
-            start=(self.cursor_x, self.cursor_y),
+            start=(entry_x, entry_y),
             end=(target_x, target_y),
             mode=NavMode.FLYING_TO_TARGET,
             on_complete=lambda: self._on_flight_landed(label, on_complete),
         )
 
     def return_to_idle(self) -> None:
-        """Fly the cursor back to the mouse position, then resume following it."""
-        mx, my = self._mouse_in_overlay()
-        self._begin_flight(
-            start=(self.cursor_x, self.cursor_y),
-            end=(mx, my),
-            mode=NavMode.RETURNING,
-            on_complete=self._on_return_landed,
-        )
+        """Fade the triangle and bubble out, then go back to invisible idle."""
+        self.mode = NavMode.FADING_OUT
+        # visible_alpha will tick down toward 0 in _tick()
 
     def start_pointing(self, label: str | None) -> None:
         """Called automatically when a flight lands — shows the bubble and holds."""
@@ -300,11 +318,6 @@ class CursorOverlay:
         if user_on_complete is not None:
             user_on_complete()
 
-    def _on_return_landed(self) -> None:
-        self.mode = NavMode.FOLLOWING_MOUSE
-        self.bubble_text = ""
-        self.bubble_alpha = 0.0
-
     # ────────────────────────────────────────────────────────────────
     # Tick loop
     # ────────────────────────────────────────────────────────────────
@@ -323,20 +336,28 @@ class CursorOverlay:
             self._tick_source = None
             return False
 
-        # Fade-in alpha
-        if self.visible_alpha < 1.0:
-            self.visible_alpha = min(1.0, self.visible_alpha + 0.12)
+        # When idle-invisible, the triangle is not drawn at all — we
+        # still run the tick so fly_to() can start immediately when
+        # called, but we skip the redraw to save cycles.
+        if self.mode == NavMode.IDLE_INVISIBLE:
+            return True
 
-        if self.mode == NavMode.FLYING_TO_TARGET or self.mode == NavMode.RETURNING:
+        # Fade in during flight, fade out during fade-out mode
+        if self.mode == NavMode.FADING_OUT:
+            self.visible_alpha = max(0.0, self.visible_alpha - 0.08)
+            if self.visible_alpha <= 0.0:
+                self.mode = NavMode.IDLE_INVISIBLE
+                self.bubble_text = ""
+                self.bubble_alpha = 0.0
+        elif self.visible_alpha < 1.0:
+            self.visible_alpha = min(1.0, self.visible_alpha + 0.18)
+
+        if self.mode == NavMode.FLYING_TO_TARGET:
             self._step_flight()
-        elif self.mode == NavMode.FOLLOWING_MOUSE:
-            mx, my = self._mouse_in_overlay()
-            # Small offset so the triangle sits diagonally below-right of cursor
-            self.cursor_x = mx + 18
-            self.cursor_y = my + 22
-            self.rotation_degrees = -35.0
         elif self.mode == NavMode.POINTING_AT_TARGET:
             self._step_pointing()
+        # FADING_OUT needs no position step; the draw() call just
+        # honors the decreasing visible_alpha.
 
         self.drawing_area.queue_draw()
         return True  # keep ticking
@@ -354,36 +375,15 @@ class CursorOverlay:
             self.return_to_idle()
 
     # ────────────────────────────────────────────────────────────────
-    # Mouse position
-    # ────────────────────────────────────────────────────────────────
-
-    def _mouse_in_overlay(self) -> tuple[float, float]:
-        try:
-            result = subprocess.run(
-                ["xdotool", "getmouselocation"],
-                capture_output=True,
-                text=True,
-                timeout=0.5,
-            )
-            import re
-            match = re.search(r"x:(\d+)\s+y:(\d+)", result.stdout)
-            if match:
-                root_x = int(match.group(1))
-                root_y = int(match.group(2))
-                return (root_x - self.origin_x, root_y - self.origin_y)
-        except Exception:
-            pass
-        return (self.cursor_x, self.cursor_y)
-
-    def _sync_cursor_to_mouse(self) -> None:
-        self.cursor_x, self.cursor_y = self._mouse_in_overlay()
-
-    # ────────────────────────────────────────────────────────────────
     # Drawing
     # ────────────────────────────────────────────────────────────────
 
     def _draw(self, _area, cr, _width: int, _height: int) -> None:
-        if self.mode == NavMode.HIDDEN or self.visible_alpha <= 0:
+        # Only draw when there's something to show. IDLE_INVISIBLE
+        # explicitly skips so your real mouse cursor is never shadowed.
+        if self.mode in (NavMode.HIDDEN, NavMode.IDLE_INVISIBLE):
+            return
+        if self.visible_alpha <= 0:
             return
         alpha = self.visible_alpha
 

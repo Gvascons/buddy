@@ -348,9 +348,10 @@ class BuddyApp:
             return False
         if self.overlay is None:
             return False
-        # Only hide if the cursor is idle (not mid-flight or pointing)
+        # Only hide if the overlay is already idle-invisible or hidden,
+        # i.e. no flight / bubble / fade-out is in progress.
         from buddy.overlay_window import NavMode
-        if self.overlay.mode not in (NavMode.FOLLOWING_MOUSE, NavMode.HIDDEN):
+        if self.overlay.mode not in (NavMode.IDLE_INVISIBLE, NavMode.HIDDEN):
             return False
         self.overlay.hide()
         return False
