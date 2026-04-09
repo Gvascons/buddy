@@ -26,7 +26,7 @@ _ALLOWED_TRANSITIONS: dict[VoiceState, set[VoiceState]] = {
     VoiceState.IDLE: {VoiceState.LISTENING},
     VoiceState.LISTENING: {VoiceState.IDLE, VoiceState.PROCESSING},
     VoiceState.PROCESSING: {VoiceState.IDLE, VoiceState.RESPONDING},
-    VoiceState.RESPONDING: {VoiceState.IDLE, VoiceState.LISTENING},
+    VoiceState.RESPONDING: {VoiceState.IDLE},
 }
 
 

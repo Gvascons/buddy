@@ -124,8 +124,8 @@ def bench_claude(claude: ClaudeAdapter, transcript: str, captures) -> tuple[str,
     return parsed.spoken_text, t.elapsed_ms
 
 
-def bench_tts_piper(text: str) -> tuple[float, float]:
-    """Return (time_to_first_audio_ms, total_synth_ms) for piper.
+def bench_tts_piper(text: str) -> tuple[float, float, float]:
+    """Return (time_to_first_audio_ms, total_synth_ms, audio_seconds).
 
     piper streams int16 PCM to stdout; we measure the wall-clock time
     from subprocess start until the first chunk arrives, then keep
@@ -166,7 +166,7 @@ def bench_tts_piper(text: str) -> tuple[float, float]:
 
     # Audio duration: piper outputs 22050 Hz mono int16
     audio_seconds = total_bytes / 2 / 22050
-    return first_chunk_ms or total_ms, total_ms, audio_seconds  # type: ignore
+    return first_chunk_ms or total_ms, total_ms, audio_seconds
 
 
 def bench_tts_kokoro(text: str) -> tuple[float, float, float]:

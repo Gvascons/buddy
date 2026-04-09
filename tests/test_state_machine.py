@@ -39,10 +39,18 @@ def test_full_happy_path():
 
 
 def test_responding_interrupted_by_new_listening():
+    """A user hotkey press mid-TTS is modeled in app.py as
+    `force(IDLE)` followed by a normal `IDLE → LISTENING` transition.
+    """
     sm = StateMachine()
     sm.transition(VoiceState.LISTENING)
     sm.transition(VoiceState.PROCESSING)
     sm.transition(VoiceState.RESPONDING)
+    # Direct RESPONDING → LISTENING is NOT an allowed edge anymore
+    assert sm.transition(VoiceState.LISTENING) is False
+    assert sm.state == VoiceState.RESPONDING
+    # But the real interrupt path goes through force():
+    sm.force(VoiceState.IDLE)
     assert sm.transition(VoiceState.LISTENING) is True
     assert sm.state == VoiceState.LISTENING
 

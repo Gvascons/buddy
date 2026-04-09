@@ -4,7 +4,7 @@ Owns:
 - StateMachine
 - WhisperSTT (loaded in a background thread on startup)
 - ClaudeAdapter
-- PiperTTS
+- TTS backend (selected by make_tts() based on BUDDY_TTS_BACKEND)
 - AudioRecorder
 - GlobalPushToTalk
 - ControlPanel (small floating window)
@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import threading
 import time
-from typing import Callable
 
 import gi
 
@@ -32,11 +31,7 @@ from buddy.claude_adapter import ClaudeAdapter
 from buddy.control_panel import ControlPanel
 from buddy.hotkey import GlobalPushToTalk
 from buddy.overlay_window import CursorOverlay
-from buddy.screenshot import (
-    capture_for_prompt,
-    enumerate_monitors,
-    root_window_bounds,
-)
+from buddy.screenshot import capture_for_prompt, enumerate_monitors
 from buddy.state_machine import StateMachine, VoiceState
 from buddy.stt_whisper import WhisperSTT
 from buddy.tts import make_tts

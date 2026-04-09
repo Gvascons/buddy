@@ -299,6 +299,3 @@ class KokoroTTS:
             except Exception:
                 pass
 
-    @property
-    def is_speaking(self) -> bool:
-        return not self._stop_event.is_set() and self._engine is not None

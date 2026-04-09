@@ -18,7 +18,7 @@ per turn for most learning-focused use cases. Override with
 from __future__ import annotations
 
 import os
-from typing import Protocol
+from typing import Callable, Protocol
 
 
 class TTSBackend(Protocol):
@@ -27,10 +27,12 @@ class TTSBackend(Protocol):
     @property
     def is_available(self) -> bool: ...
     def warmup(self) -> None: ...
-    def speak(self, text: str, on_started=None) -> None: ...
+    def speak(
+        self,
+        text: str,
+        on_started: Callable[[], None] | None = None,
+    ) -> None: ...
     def stop(self) -> None: ...
-    @property
-    def is_speaking(self) -> bool: ...
 
 
 DEFAULT_BACKEND = "kokoro"

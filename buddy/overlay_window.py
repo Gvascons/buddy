@@ -42,7 +42,6 @@ from buddy.screenshot import Monitor, root_window_bounds
 
 FRAME_INTERVAL_MS = 16          # ~60fps
 POINTING_HOLD_SECONDS = 2.5     # how long to sit at the target before returning
-BUBBLE_WIDTH = 180
 BUBBLE_PADDING = 12
 
 CURSOR_BLUE = (0.30, 0.55, 1.00, 0.95)
@@ -62,8 +61,7 @@ class NavMode(enum.Enum):
 
 class CursorOverlay:
     def __init__(self, monitors: Sequence[Monitor]) -> None:
-        self.monitors = list(monitors)
-        ox, oy, ow, oh = root_window_bounds(self.monitors)
+        ox, oy, ow, oh = root_window_bounds(list(monitors))
         self.origin_x, self.origin_y = ox, oy
         self.overlay_width, self.overlay_height = ow, oh
 

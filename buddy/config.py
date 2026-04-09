@@ -13,12 +13,9 @@ from pathlib import Path
 # Paths
 # ────────────────────────────────────────────────────────────────────
 
-HOME = Path.home()
-
 # Piper TTS: downloaded once via the README curl one-liner.
-PIPER_DIR = HOME / ".local" / "share" / "buddy" / "piper"
+PIPER_DIR = Path.home() / ".local" / "share" / "buddy" / "piper"
 PIPER_MODEL_PATH = PIPER_DIR / "en_US-amy-medium.onnx"
-PIPER_CONFIG_PATH = PIPER_DIR / "en_US-amy-medium.onnx.json"
 PIPER_BINARY = os.environ.get("BUDDY_PIPER_BINARY", "piper")
 
 # Temp dir for the most-recent multi-monitor screenshot capture.

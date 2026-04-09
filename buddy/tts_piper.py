@@ -142,8 +142,3 @@ class PiperTTS:
             except Exception:
                 pass
 
-    @property
-    def is_speaking(self) -> bool:
-        with self._proc_lock:
-            proc = self._proc
-        return proc is not None and proc.poll() is None

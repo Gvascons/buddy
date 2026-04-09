@@ -19,7 +19,7 @@ import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 gi.require_version("Gdk", "4.0")
-from gi.repository import Gtk, Adw, Gdk, GLib  # noqa: E402
+from gi.repository import Gtk, Adw, Gdk  # noqa: E402
 
 from buddy import config, xlib_helpers
 from buddy.state_machine import VoiceState
@@ -176,14 +176,12 @@ class ControlPanel:
         self.transcript_label = Gtk.Label(label="", xalign=0)
         self.transcript_label.add_css_class("buddy-transcript")
         self.transcript_label.set_wrap(True)
-        self.transcript_label.set_xalign(0)
         self.transcript_label.set_selectable(True)
         body.append(self.transcript_label)
 
         self.response_label = Gtk.Label(label="", xalign=0)
         self.response_label.add_css_class("buddy-response")
         self.response_label.set_wrap(True)
-        self.response_label.set_xalign(0)
         self.response_label.set_selectable(True)
         body.append(self.response_label)
 
