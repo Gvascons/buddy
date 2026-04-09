@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg
+*.egg-info/
+.eggs/
+build/
+dist/
+pip-wheel-metadata/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Editable installs
+*.dist-info/
+
+# Local model caches (downloaded at first run, NOT committed)
+models/
+*.onnx
+*.onnx.json
+
+# Buddy runtime state
+/tmp/buddy_captures/
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+nano.*.save
+.claude/
+
+# Test + coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Logs
+*.log
