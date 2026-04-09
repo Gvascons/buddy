@@ -87,6 +87,11 @@ class BuddyApp:
         self.overlay.window.present()
         GLib.timeout_add(50, self._hide_overlay_initially)
 
+        # Register our own window XIDs so the active-window crop
+        # never tries to screenshot buddy's own UI. Delayed so the
+        # windows are fully realized + mapped before we ask for IDs.
+        GLib.timeout_add(400, self._register_own_windows)
+
         # Hotkey listener
         self.hotkey = GlobalPushToTalk(
             on_press=self._on_hotkey_press,
@@ -104,6 +109,28 @@ class BuddyApp:
     def _hide_overlay_initially(self) -> bool:
         if self.overlay is not None and self._cursor_mode == "transient":
             self.overlay.hide()
+        return False
+
+    def _register_own_windows(self) -> bool:
+        """Tell screenshot.py which X11 window IDs belong to us so the
+        active-window crop ignores buddy's own control panel and
+        cursor overlay.
+        """
+        from buddy import screenshot, xlib_helpers
+        registered: list[int] = []
+        if self.control_panel is not None:
+            xid = xlib_helpers.get_xid(self.control_panel.window)
+            if xid:
+                screenshot.register_own_window_id(xid)
+                registered.append(xid)
+        if self.overlay is not None:
+            xid = xlib_helpers.get_xid(self.overlay.window)
+            if xid:
+                screenshot.register_own_window_id(xid)
+                registered.append(xid)
+        if registered:
+            hexes = ", ".join(f"0x{x:x}" for x in registered)
+            print(f"🪟 registered own window ids: {hexes}")
         return False
 
     def _load_and_warm_whisper(self) -> None:

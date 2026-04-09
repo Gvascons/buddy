@@ -17,6 +17,16 @@ gi.require_version("Gtk", "4.0")
 from gi.repository import GLib
 
 
+def get_xid(gtk_window) -> int | None:
+    """Return the X11 window ID for a GTK4 window, or None if unavailable.
+
+    Public wrapper for the internal `_get_xid`. Used by app.py to
+    register our own windows with screenshot.py so the active-window
+    crop never tries to screenshot buddy's own UI.
+    """
+    return _get_xid(gtk_window)
+
+
 def _get_xid(gtk_window) -> int | None:
     """Return the X11 window ID for a GTK4 window, or None if unavailable."""
     try:

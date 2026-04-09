@@ -248,26 +248,63 @@ class ActiveWindow:
     height: int
 
 
-# Window titles we never want to crop to — our own UI, taskbars, etc.
-_IGNORED_WINDOW_TITLE_SUBSTRINGS = (
-    "buddy",
-    "buddy-voice-coworker",
+# Window classes we never want to crop to — desktop shells, panels.
+# These are WM_CLASS values, which are much more reliable than titles
+# (titles change every time a Chrome tab switches).
+_IGNORED_WINDOW_CLASSES = frozenset({
     "xfce4-panel",
     "gnome-shell",
     "polybar",
     "plasmashell",
-)
+    "xfdesktop",
+    "plank",
+})
+
+# Our own buddy windows are identified by X11 window ID, not by title
+# or class — that's the only 100% reliable way, because Chrome or any
+# other app might have a tab title containing "buddy" (e.g. when the
+# user has the buddy GitHub repo open in a browser tab).
+# app.py populates this set at startup via register_own_window_id().
+_OWN_WINDOW_IDS: set[int] = set()
+
+
+def register_own_window_id(window_id: int) -> None:
+    """Called at startup to mark a GTK window's XID as 'ours' so the
+    active-window crop never tries to screenshot buddy's own UI."""
+    if window_id:
+        _OWN_WINDOW_IDS.add(int(window_id))
+
 
 # Minimum window size to be considered "a real app window" vs a popup.
 _MIN_WINDOW_WIDTH = 600
 _MIN_WINDOW_HEIGHT = 400
 
 
+def _active_window_class() -> str:
+    """Return the WM_CLASS of the currently active window, lowercased.
+
+    Uses `xdotool getactivewindow getwindowclassname` which returns
+    the instance name portion of WM_CLASS (e.g. "firefox", "blender").
+    Returns empty string on failure.
+    """
+    try:
+        result = subprocess.run(
+            ["xdotool", "getactivewindow", "getwindowclassname"],
+            capture_output=True, text=True, timeout=2, check=True,
+        )
+        return result.stdout.strip().lower()
+    except Exception:
+        return ""
+
+
 def active_window() -> ActiveWindow | None:
     """Query xdotool for the currently focused X11 window.
 
-    Returns None if no window is focused, if the focused window is
-    buddy's own panel, or if the window is too small to be a real app.
+    Returns None if:
+      - no window is focused
+      - the focused window is one of buddy's own (tracked by XID)
+      - the focused window's WM_CLASS is a desktop shell / panel
+      - the focused window is too small to be a real app
     """
     try:
         geo = subprocess.run(
@@ -292,7 +329,24 @@ def active_window() -> ActiveWindow | None:
     except (KeyError, ValueError):
         return None
 
-    # Get the window title too, so we can skip our own UI.
+    # Skip one of our own buddy windows (control panel, overlay) by
+    # exact X11 window ID. This is the only reliable filter — title
+    # substrings like "buddy" can match any app that has the word in
+    # its title (e.g. a Chrome tab showing the buddy GitHub repo).
+    if window_id in _OWN_WINDOW_IDS:
+        return None
+
+    # Skip desktop shells and taskbars by their WM_CLASS.
+    wm_class = _active_window_class()
+    if wm_class in _IGNORED_WINDOW_CLASSES:
+        return None
+
+    # Skip tooltips, popups, and tiny transient windows.
+    if width < _MIN_WINDOW_WIDTH or height < _MIN_WINDOW_HEIGHT:
+        return None
+
+    # Get the window title for the label we pass to Claude (purely
+    # informational — doesn't affect routing).
     try:
         title = subprocess.run(
             ["xdotool", "getactivewindow", "getwindowname"],
@@ -300,14 +354,6 @@ def active_window() -> ActiveWindow | None:
         ).stdout.strip()
     except Exception:
         title = ""
-
-    # Skip our own panel, DE shells, tiny popups.
-    title_lower = title.lower()
-    for ignore in _IGNORED_WINDOW_TITLE_SUBSTRINGS:
-        if ignore in title_lower:
-            return None
-    if width < _MIN_WINDOW_WIDTH or height < _MIN_WINDOW_HEIGHT:
-        return None
 
     return ActiveWindow(
         window_id=window_id,
