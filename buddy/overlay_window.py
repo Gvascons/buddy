@@ -26,6 +26,8 @@ from __future__ import annotations
 
 import enum
 import math
+import re
+import subprocess
 from typing import Callable, Sequence
 
 import gi
@@ -169,32 +171,58 @@ class CursorOverlay:
     ) -> None:
         """Begin a quadratic Bezier flight to (target_x, target_y).
 
-        Coordinates are overlay-local. Since the triangle is invisible
-        when idle, the flight originates from a point near the target:
-        the triangle swoops in from ~160px above-left, so you see it
-        arrive rather than teleport. `label` is displayed in the
-        bubble once the flight completes.
+        Coordinates are overlay-local. The triangle spawns at your
+        current mouse cursor position, so the flight originates from
+        where you were already looking and clearly shows the trajectory
+        to the target. After landing, the label bubble streams in and
+        then everything fades out.
         """
         if self.mode == NavMode.HIDDEN:
             self.show()
 
-        # Entrance point — slightly above-left of the target so the
-        # flight has some arc, but short so it doesn't waste screen time
-        # flying across the whole desktop.
-        entry_x = target_x - 160.0
-        entry_y = target_y - 120.0
+        # Spawn at the user's real mouse cursor so the trajectory
+        # starts from where they are looking.
+        start_x, start_y = self._mouse_in_overlay()
+
+        # If the mouse happens to be right on the target, offset a bit
+        # so the flight is still visible.
+        if abs(start_x - target_x) < 8 and abs(start_y - target_y) < 8:
+            start_x = target_x - 120.0
+            start_y = target_y - 90.0
 
         # Reset visual state
-        self.cursor_x = entry_x
-        self.cursor_y = entry_y
+        self.cursor_x = start_x
+        self.cursor_y = start_y
         self.visible_alpha = 0.0
 
         self._begin_flight(
-            start=(entry_x, entry_y),
+            start=(start_x, start_y),
             end=(target_x, target_y),
             mode=NavMode.FLYING_TO_TARGET,
             on_complete=lambda: self._on_flight_landed(label, on_complete),
         )
+
+    def _mouse_in_overlay(self) -> tuple[float, float]:
+        """Query the real mouse cursor position in overlay-local pixels."""
+        try:
+            result = subprocess.run(
+                ["xdotool", "getmouselocation"],
+                capture_output=True,
+                text=True,
+                timeout=0.5,
+            )
+            match = re.search(r"x:(\d+)\s+y:(\d+)", result.stdout)
+            if match:
+                root_x = int(match.group(1))
+                root_y = int(match.group(2))
+                return (
+                    float(root_x - self.origin_x),
+                    float(root_y - self.origin_y),
+                )
+        except Exception:
+            pass
+        # Fallback: overlay center
+        return (self.overlay_width / 2.0, self.overlay_height / 2.0)
 
     def return_to_idle(self) -> None:
         """Fade the triangle and bubble out, then go back to invisible idle."""
@@ -425,15 +453,36 @@ class CursorOverlay:
         if not shown:
             return
 
-        # Position bubble above-right of cursor
-        bx = self.cursor_x + 26
-        by = self.cursor_y - 44
+        # Measure the text accurately using Cairo's font metrics so the
+        # bubble rectangle is always the right size.
+        cr.save()
+        cr.select_font_face("Sans", 0, 0)
+        cr.set_font_size(13)
+        extents = cr.text_extents(shown)
+        text_width = extents.width
+        text_height = 16  # baseline-to-baseline for 13pt
+        cr.restore()
 
-        # Rough text width (we don't have pango here yet)
-        text_width = min(BUBBLE_WIDTH, max(40, len(shown) * 8))
-        text_height = 22
         w = text_width + BUBBLE_PADDING * 2
-        h = text_height + BUBBLE_PADDING
+        h = text_height + BUBBLE_PADDING * 2
+        cursor_gap = 26   # distance from cursor tip to nearest bubble edge
+
+        # Default placement: bubble above-right of the cursor tip
+        bx = self.cursor_x + cursor_gap
+        by = self.cursor_y - h - 10
+
+        # If it would overflow the right edge of the overlay, flip
+        # to the left side of the cursor
+        if bx + w > self.overlay_width - 8:
+            bx = self.cursor_x - w - cursor_gap
+
+        # If it would overflow the top, flip below the cursor
+        if by < 8:
+            by = self.cursor_y + cursor_gap
+
+        # Final clamp to keep it fully on screen even on awkward edges
+        bx = max(8.0, min(bx, self.overlay_width - w - 8))
+        by = max(8.0, min(by, self.overlay_height - h - 8))
 
         cr.save()
         cr.translate(bx, by)
@@ -456,11 +505,12 @@ class CursorOverlay:
         cr.set_line_width(1.5)
         cr.stroke()
 
-        # Text
+        # Text — draw using the same font we measured with
         r, g, b, a = BUBBLE_TEXT
         cr.set_source_rgba(r, g, b, a * alpha * self.bubble_alpha)
         cr.select_font_face("Sans", 0, 0)
         cr.set_font_size(13)
-        cr.move_to(BUBBLE_PADDING, BUBBLE_PADDING + 12)
+        # Baseline is at y = BUBBLE_PADDING + text_height - 3 (visual centering)
+        cr.move_to(BUBBLE_PADDING, BUBBLE_PADDING + text_height - 3)
         cr.show_text(shown)
         cr.restore()
