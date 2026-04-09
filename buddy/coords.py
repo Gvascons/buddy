@@ -63,20 +63,23 @@ def resolve_point(
     if target is None:
         target = captures[0]
 
-    # Clamp to the capture's pixel bounds
+    # Clamp Claude's POINT to the image-file pixel bounds
     sx = max(0, min(int(parsed.point_x), target.width - 1))
     sy = max(0, min(int(parsed.point_y), target.height - 1))
 
-    # Rescale from screenshot pixels to monitor pixels.
-    # In v0 the screenshot IS at native monitor resolution, so the
-    # scale factors are 1.0; this multiplication only matters if we
-    # later resize screenshots before sending them to Claude.
-    # Mirrors CompanionManager.swift:653-665.
-    mx = sx * (target.width / target.width)   # == sx
-    my = sy * (target.height / target.height) # == sy
+    # Rescale from image-file pixels to source-region pixels. When we
+    # pre-resize captures to ~800px long edge before sending to Claude
+    # (to avoid the CLI's aggressive auto-downsize), target.width is
+    # the resized size and target.source_width is the real on-screen
+    # region. For source ≤ 800px they're equal and this is a no-op.
+    scale_x = target.source_width / target.width if target.width else 1.0
+    scale_y = target.source_height / target.height if target.height else 1.0
+    mx = sx * scale_x
+    my = sy * scale_y
 
-    # Translate to root-window coordinates by adding the monitor offset,
-    # then to overlay-local coordinates by subtracting the overlay origin.
+    # Translate to root-window coordinates by adding the region's root
+    # offset, then to overlay-local coordinates by subtracting the
+    # overlay origin.
     root_x = target.monitor_x + mx
     root_y = target.monitor_y + my
     overlay_x = root_x - overlay_origin_x

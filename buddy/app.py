@@ -33,7 +33,7 @@ from buddy.control_panel import ControlPanel
 from buddy.hotkey import GlobalPushToTalk
 from buddy.overlay_window import CursorOverlay
 from buddy.screenshot import (
-    capture_all_monitors,
+    capture_for_prompt,
     enumerate_monitors,
     root_window_bounds,
 )
@@ -209,7 +209,7 @@ class BuddyApp:
             # 2. Capture screens (hide overlay first)
             self._hide_overlay_for_capture()
             time.sleep(0.05)
-            captures = capture_all_monitors(self.monitors)
+            captures = capture_for_prompt(self.monitors)
             self._restore_overlay_after_capture()
 
             # 3. Ask Claude

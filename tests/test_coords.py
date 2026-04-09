@@ -5,11 +5,15 @@ from buddy.coords import resolve_point
 
 
 def _capture(idx: int, mx: int, my: int, w: int, h: int, is_cursor: bool) -> ScreenCapture:
+    """A ScreenCapture where the image Claude sees equals the source region
+    (i.e. no pre-resize). Default case for the coordinate-mapping tests."""
     return ScreenCapture(
-        image_path=f"/tmp/cap_{idx}.png",
+        image_path=f"/tmp/cap_{idx}.jpg",
         label=f"screen {idx} (image dimensions: {w}x{h} pixels)",
         width=w,
         height=h,
+        source_width=w,
+        source_height=h,
         monitor_index=idx,
         monitor_x=mx,
         monitor_y=my,
@@ -119,3 +123,55 @@ def test_overlay_origin_subtracted():
     assert target is not None
     assert target.overlay_x == 500 - (-100)
     assert target.overlay_y == 400 - (-50)
+
+
+def test_resized_image_scales_point_back_to_source():
+    """Active window 1920x1080 resized to 800x450 for Claude.
+
+    Claude emits POINT(400, 225) — the centre of the image it sees.
+    That should resolve to the centre of the source window:
+    (window.x + 960, window.y + 540) = (1000 + 960, 500 + 540).
+    """
+    capture = ScreenCapture(
+        image_path="/tmp/cap_active.jpg",
+        label="active window (image dimensions: 800x450 pixels)",
+        width=800,                 # what Claude sees
+        height=450,
+        source_width=1920,         # real window pixels
+        source_height=1080,
+        monitor_index=1,
+        monitor_x=1000,            # window's root-relative top-left
+        monitor_y=500,
+        is_cursor_screen=True,
+    )
+    parsed = ParsedResponse(
+        spoken_text="middle", point_x=400, point_y=225, label="foo", screen_number=None
+    )
+    target = resolve_point(parsed, [capture])
+    assert target is not None
+    # 400/800 * 1920 + 1000 = 960 + 1000 = 1960
+    assert target.overlay_x == 1960
+    # 225/450 * 1080 + 500 = 540 + 500 = 1040
+    assert target.overlay_y == 1040
+
+
+def test_resized_image_clamps_to_image_bounds_not_source_bounds():
+    """POINT is clamped to the Claude-visible dims, not the source dims."""
+    capture = ScreenCapture(
+        image_path="/tmp/cap_active.jpg",
+        label="active window (image dimensions: 800x450 pixels)",
+        width=800, height=450,
+        source_width=1920, source_height=1080,
+        monitor_index=1,
+        monitor_x=0, monitor_y=0,
+        is_cursor_screen=True,
+    )
+    parsed = ParsedResponse(
+        spoken_text="edge", point_x=5000, point_y=5000,
+        label="foo", screen_number=None,
+    )
+    target = resolve_point(parsed, [capture])
+    assert target is not None
+    # Clamped to (799, 449), then scaled up to source: (799/800 * 1920, 449/450 * 1080)
+    assert round(target.overlay_x) == round(799 * 1920 / 800)
+    assert round(target.overlay_y) == round(449 * 1080 / 450)

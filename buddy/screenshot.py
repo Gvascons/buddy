@@ -1,11 +1,19 @@
 """X11 screenshot + monitor enumeration.
 
-Uses ffmpeg's x11grab backend to capture one PNG per connected monitor.
-Enumerates monitors via `xrandr --query` and picks up the cursor's
-current monitor via `xdotool getmouselocation`.
+Uses ffmpeg's x11grab backend to capture PNGs. By default it crops to
+the **active application window** (e.g. Blender, DaVinci Resolve) via
+`xdotool getactivewindow`, because the `claude -p --tools Read` path
+aggressively downsizes images to ~500px on the long edge regardless
+of what we send. Cropping to one app means that 500px worth of pixel
+budget is all spent on the UI the user is asking about — not wasted
+on desktop background or other windows.
 
-The generated ScreenCapture labels match Clicky's "primary focus" style
-so Claude can use `[POINT:x,y:screenN]` correctly.
+Falls back to full-monitor capture (multi-monitor aware, with screen
+labels) when:
+  - xdotool reports no active window
+  - the active window is buddy's own control panel
+  - the active window is too small (tooltip, popup)
+  - the user forces it via BUDDY_CAPTURE_MODE=monitor
 """
 
 from __future__ import annotations
@@ -22,6 +30,14 @@ from buddy.claude_adapter import ScreenCapture
 
 
 DISPLAY = os.environ.get("DISPLAY", ":0")
+
+# Pre-resize target for images sent to Claude. The `claude -p --tools Read`
+# harness downsizes any image aggressively — but empirical testing shows
+# that anything ≤800 px on the long edge survives at 1:1 resolution, while
+# anything larger gets at least 2× further downsized. So we cap the long
+# edge at 800 and save as JPEG quality 92 to keep file size small.
+CLAUDE_MAX_LONG_EDGE = int(os.environ.get("BUDDY_SCREENSHOT_MAX_EDGE", "800"))
+JPEG_QUALITY = 92
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -166,6 +182,222 @@ def _capture_one(monitor: Monitor, output_path: Path) -> None:
     subprocess.run(cmd, capture_output=True, timeout=10, check=True)
 
 
+def _capture_region(
+    x: int, y: int, width: int, height: int, output_path: Path,
+) -> None:
+    """Call ffmpeg to capture a root-relative rectangle to `output_path`."""
+    cmd = [
+        "ffmpeg",
+        "-loglevel", "error",
+        "-f", "x11grab",
+        "-video_size", f"{width}x{height}",
+        "-i", f"{DISPLAY}+{x},{y}",
+        "-frames:v", "1",
+        "-update", "1",
+        "-y",
+        str(output_path),
+    ]
+    subprocess.run(cmd, capture_output=True, timeout=10, check=True)
+
+
+def _resize_for_claude(png_path: Path, jpg_path: Path) -> tuple[int, int]:
+    """Resize the PNG at `png_path` to ≤CLAUDE_MAX_LONG_EDGE long edge
+    and save as JPEG at `jpg_path`. Returns (out_width, out_height).
+
+    We use Pillow with LANCZOS resampling for quality. If the source
+    is already under the cap we still re-save as JPEG to benefit from
+    the smaller file size (Claude CLI seems to downsize PNG more
+    aggressively than JPEG at similar absolute pixel counts).
+    """
+    from PIL import Image
+
+    with Image.open(png_path) as img:
+        img.load()  # force decode before we mess with the file
+        w, h = img.size
+        long_edge = max(w, h)
+        if long_edge > CLAUDE_MAX_LONG_EDGE:
+            scale = CLAUDE_MAX_LONG_EDGE / long_edge
+            new_w = int(round(w * scale))
+            new_h = int(round(h * scale))
+            resized = img.resize((new_w, new_h), Image.LANCZOS)
+        else:
+            new_w, new_h = w, h
+            resized = img.copy()
+        # JPEG wants RGB, not RGBA
+        if resized.mode != "RGB":
+            resized = resized.convert("RGB")
+        resized.save(jpg_path, "JPEG", quality=JPEG_QUALITY, optimize=True)
+    try:
+        png_path.unlink()
+    except FileNotFoundError:
+        pass
+    return new_w, new_h
+
+
+# ────────────────────────────────────────────────────────────────────
+# Active window detection
+# ────────────────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class ActiveWindow:
+    window_id: int
+    title: str
+    x: int
+    y: int
+    width: int
+    height: int
+
+
+# Window titles we never want to crop to — our own UI, taskbars, etc.
+_IGNORED_WINDOW_TITLE_SUBSTRINGS = (
+    "buddy",
+    "buddy-voice-coworker",
+    "xfce4-panel",
+    "gnome-shell",
+    "polybar",
+    "plasmashell",
+)
+
+# Minimum window size to be considered "a real app window" vs a popup.
+_MIN_WINDOW_WIDTH = 600
+_MIN_WINDOW_HEIGHT = 400
+
+
+def active_window() -> ActiveWindow | None:
+    """Query xdotool for the currently focused X11 window.
+
+    Returns None if no window is focused, if the focused window is
+    buddy's own panel, or if the window is too small to be a real app.
+    """
+    try:
+        geo = subprocess.run(
+            ["xdotool", "getactivewindow", "getwindowgeometry", "--shell"],
+            capture_output=True, text=True, timeout=2, check=True,
+        ).stdout
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError):
+        return None
+
+    fields: dict[str, str] = {}
+    for line in geo.splitlines():
+        if "=" in line:
+            k, v = line.split("=", 1)
+            fields[k.strip()] = v.strip()
+
+    try:
+        window_id = int(fields["WINDOW"])
+        x = int(fields["X"])
+        y = int(fields["Y"])
+        width = int(fields["WIDTH"])
+        height = int(fields["HEIGHT"])
+    except (KeyError, ValueError):
+        return None
+
+    # Get the window title too, so we can skip our own UI.
+    try:
+        title = subprocess.run(
+            ["xdotool", "getactivewindow", "getwindowname"],
+            capture_output=True, text=True, timeout=2, check=True,
+        ).stdout.strip()
+    except Exception:
+        title = ""
+
+    # Skip our own panel, DE shells, tiny popups.
+    title_lower = title.lower()
+    for ignore in _IGNORED_WINDOW_TITLE_SUBSTRINGS:
+        if ignore in title_lower:
+            return None
+    if width < _MIN_WINDOW_WIDTH or height < _MIN_WINDOW_HEIGHT:
+        return None
+
+    return ActiveWindow(
+        window_id=window_id,
+        title=title,
+        x=x, y=y,
+        width=width,
+        height=height,
+    )
+
+
+def capture_active_window(
+    monitors: Sequence[Monitor] | None = None,
+) -> list[ScreenCapture]:
+    """Capture just the currently focused app window.
+
+    Returns a single ScreenCapture with `monitor_x/y` set to the window's
+    root-relative origin, so POINT coordinates emitted by Claude (which
+    are in the cropped image's pixel space) resolve back to the correct
+    root-window pixel via the existing coords.resolve_point() logic.
+
+    Returns [] if no suitable active window is detected; the caller
+    should then fall back to capture_all_monitors().
+    """
+    window = active_window()
+    if window is None:
+        return []
+    if monitors is None:
+        monitors = enumerate_monitors()
+
+    out_dir = _ensure_screenshot_dir()
+    png_path = out_dir / "capture_active.png"
+    jpg_path = out_dir / "capture_active.jpg"
+    try:
+        _capture_region(window.x, window.y, window.width, window.height, png_path)
+    except subprocess.CalledProcessError as exc:
+        print(f"⚠️ screenshot: ffmpeg failed for active window: {exc.stderr!r}")
+        return []
+    except subprocess.TimeoutExpired:
+        print("⚠️ screenshot: ffmpeg timed out for active window")
+        return []
+
+    # Resize to ≤800 long edge + JPEG encode, so Claude sees 1:1
+    try:
+        claude_w, claude_h = _resize_for_claude(png_path, jpg_path)
+    except Exception as exc:
+        print(f"⚠️ screenshot: resize failed: {exc}")
+        return []
+
+    label = (
+        f'cropped to the active application window "{window.title or "(untitled)"}" '
+        f"(image dimensions: {claude_w}x{claude_h} pixels). "
+        "this is the full screenshot — there is nothing outside this crop. "
+        "POINT coordinates should be in this image's pixel space."
+    )
+
+    return [ScreenCapture(
+        image_path=str(jpg_path),
+        label=label,
+        width=claude_w,
+        height=claude_h,
+        source_width=window.width,
+        source_height=window.height,
+        monitor_index=1,
+        monitor_x=window.x,
+        monitor_y=window.y,
+        is_cursor_screen=True,
+    )]
+
+
+def capture_for_prompt(
+    monitors: Sequence[Monitor] | None = None,
+) -> list[ScreenCapture]:
+    """Produce the list of ScreenCaptures to send to Claude for one turn.
+
+    By default this crops to the active application window (which
+    gives Claude ~4x more effective resolution per UI element since the
+    claude CLI auto-downsizes images to ~500px long edge). Falls back
+    to per-monitor captures if no real app window is focused, or when
+    the user sets BUDDY_CAPTURE_MODE=monitor.
+    """
+    mode = os.environ.get("BUDDY_CAPTURE_MODE", "auto").strip().lower()
+    if mode != "monitor":
+        captures = capture_active_window(monitors)
+        if captures:
+            print(f"📸 capture: active window ({captures[0].label})")
+            return captures
+    print("📸 capture: full monitor(s)")
+    return capture_all_monitors(monitors)
+
+
 def capture_all_monitors(
     monitors: Sequence[Monitor] | None = None,
 ) -> list[ScreenCapture]:
@@ -192,9 +424,10 @@ def capture_all_monitors(
     total = len(ordered)
     captures: list[ScreenCapture] = []
     for idx, mon in enumerate(ordered, start=1):
-        image_path = out_dir / f"capture_{idx}.png"
+        png_path = out_dir / f"capture_{idx}.png"
+        jpg_path = out_dir / f"capture_{idx}.jpg"
         try:
-            _capture_one(mon, image_path)
+            _capture_one(mon, png_path)
         except subprocess.CalledProcessError as exc:
             print(f"⚠️ screenshot: ffmpeg failed for {mon.name}: {exc.stderr!r}")
             continue
@@ -202,17 +435,26 @@ def capture_all_monitors(
             print(f"⚠️ screenshot: ffmpeg timed out for {mon.name}")
             continue
 
+        try:
+            claude_w, claude_h = _resize_for_claude(png_path, jpg_path)
+        except Exception as exc:
+            print(f"⚠️ screenshot: resize failed for {mon.name}: {exc}")
+            continue
+
         is_cursor = (mon is cursor_mon)
         focus_note = " — cursor is on this screen (primary focus)" if is_cursor else ""
         label = (
             f"screen {idx} of {total} ({mon.name}){focus_note} "
-            f"(image dimensions: {mon.width}x{mon.height} pixels)"
+            f"(image dimensions: {claude_w}x{claude_h} pixels). "
+            "POINT coordinates should be in this image's pixel space."
         )
         captures.append(ScreenCapture(
-            image_path=str(image_path),
+            image_path=str(jpg_path),
             label=label,
-            width=mon.width,
-            height=mon.height,
+            width=claude_w,
+            height=claude_h,
+            source_width=mon.width,
+            source_height=mon.height,
             monitor_index=idx,
             monitor_x=mon.x,
             monitor_y=mon.y,

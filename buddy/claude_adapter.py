@@ -97,17 +97,29 @@ def _scrub_cli_artifacts(text: str) -> str:
 
 @dataclass
 class ScreenCapture:
-    """One monitor's screenshot as passed to Claude.
+    """One screenshot as passed to Claude.
 
-    The `label` must include the pixel dimensions so Claude's POINT
-    coordinates are in the correct space.
+    `width` / `height` are the dimensions of the image file on disk AND
+    the coordinate space Claude's POINT(x,y) tags operate in — they
+    must match the dimensions embedded in the label.
+
+    `source_width` / `source_height` are the dimensions of the original
+    region that was cropped (the app window or the monitor). If the
+    image was resized before being handed to Claude, these two pairs
+    differ and `coords.resolve_point()` scales by the ratio.
+
+    `monitor_x` / `monitor_y` are the root-window coordinates of the
+    top-left corner of that *source* region — adding them to the
+    scaled-back POINT gives the root-window pixel to fly the cursor to.
     """
     image_path: str
-    label: str              # human-readable: "screen 1 of 2 — cursor on this screen (primary focus) (image dimensions: 2560x1440 pixels)"
-    width: int              # pixels of the saved screenshot
+    label: str              # "cropped to the active application window ... (image dimensions: 800x533 pixels)"
+    width: int              # pixels of the saved screenshot (Claude's POINT space)
     height: int
+    source_width: int       # pixels of the original unresized crop
+    source_height: int
     monitor_index: int      # 1-based, matches :screenN tag
-    monitor_x: int          # root-window offset
+    monitor_x: int          # root-window offset of the source region
     monitor_y: int
     is_cursor_screen: bool
 
