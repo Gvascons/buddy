@@ -411,6 +411,38 @@ def active_window() -> ActiveWindow | None:
     if wm_class in _IGNORED_WINDOW_CLASSES:
         return None
 
+    # Clamp the window rect to the union of all monitor rects. On
+    # GNOME/Mutter with client-side decorations, xdotool sometimes
+    # reports geometry extending past the actual screen (e.g. Blender
+    # maximized at 2560x1440 can report a height of 1371 starting at
+    # y=106, which overflows the screen by 37 pixels at the bottom).
+    # ffmpeg's x11grab refuses to capture outside the root window,
+    # so without this clamp the active-window crop silently fails and
+    # falls back to full-monitor mode — which defeats the whole point
+    # of cropping for better SoM resolution.
+    monitors = enumerate_monitors()
+    if monitors:
+        root_min_x = min(m.x for m in monitors)
+        root_min_y = min(m.y for m in monitors)
+        root_max_x = max(m.x + m.width for m in monitors)
+        root_max_y = max(m.y + m.height for m in monitors)
+
+        clamped_x = max(root_min_x, x)
+        clamped_y = max(root_min_y, y)
+        clamped_right = min(root_max_x, x + width)
+        clamped_bottom = min(root_max_y, y + height)
+        clamped_width = clamped_right - clamped_x
+        clamped_height = clamped_bottom - clamped_y
+
+        if clamped_width != width or clamped_height != height:
+            print(
+                f"🔧 active window: clamped from "
+                f"{width}x{height}@({x},{y}) to "
+                f"{clamped_width}x{clamped_height}@({clamped_x},{clamped_y})"
+            )
+        x, y = clamped_x, clamped_y
+        width, height = clamped_width, clamped_height
+
     # Skip tooltips, popups, and tiny transient windows.
     if width < _MIN_WINDOW_WIDTH or height < _MIN_WINDOW_HEIGHT:
         return None

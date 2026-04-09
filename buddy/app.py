@@ -278,9 +278,13 @@ class BuddyApp:
             parsed = self.claude.ask(transcript, captures)
             print(f"💬 claude: {parsed.spoken_text!r}")
             if parsed.has_coordinate:
+                if parsed.cell is not None:
+                    coord_str = f"cell {parsed.cell}"
+                else:
+                    coord_str = f"pixel ({parsed.point_x},{parsed.point_y})"
                 print(
-                    f"   pointing at ({parsed.point_x},{parsed.point_y}) "
-                    f"{parsed.label} screen={parsed.screen_number}"
+                    f"   pointing at {coord_str} "
+                    f"{parsed.label!r} screen={parsed.screen_number}"
                 )
 
             if not self._worker_still_wanted():
