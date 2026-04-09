@@ -2,25 +2,27 @@
 
 A push-to-talk voice coworker for Linux that watches your screen and flies a blue triangle cursor to the menu, button, or panel you're asking about. Designed for learning Blender, DaVinci Resolve, Godot, and similar creative software without leaving the app.
 
-Combines the "real coworker" feel of [Clicky](https://github.com/farzaa/clicky) with the zero-API-key simplicity of [screen-copilot](https://github.com/Gvascons/screen-copilot). Everything runs locally — the only cloud call is the `claude -p` CLI talking to your existing Claude MAX subscription.
+Spiritual successor to [Clicky](https://github.com/farzaa/clicky) for Linux/X11, with architectural borrowings from [screen-copilot](https://github.com/Gvascons/screen-copilot). Voice input, TTS, and the whole GUI run locally; only the LLM call leaves your machine.
 
 ## What it does
 
 1. You hold **Ctrl+Alt+Space** and ask your question out loud.
-2. `faster-whisper` transcribes your voice locally.
-3. buddy hides its own overlay, grabs a fresh screenshot of every monitor, and restores the overlay.
-4. `claude -p` looks at the screenshots and answers in one or two spoken sentences.
-5. `piper` speaks the reply.
-6. If Claude sees what you asked about, a blue triangle flies along a Bezier arc to the exact UI element and labels it.
-
-No API keys. No cloud services beyond the `claude` CLI you already use.
+2. `faster-whisper` transcribes your voice locally (mic → text, no network).
+3. buddy hides its own overlay, crops a fresh screenshot of your active app window (or falls back to per-monitor captures), and restores the overlay.
+4. Claude looks at the screenshot and answers in one or two spoken sentences. Two interchangeable backends:
+    - **Anthropic API** when `ANTHROPIC_API_KEY` is set — higher vision resolution, streaming responses, ~1-3 s per turn, ~$0.0005 per turn with haiku.
+    - **`claude -p` CLI** otherwise — works with any Claude Pro/Max subscription, no API key, ~5-10 s per turn.
+5. Kokoro (default) or Piper speaks the reply. All local, no cloud TTS.
+6. If Claude's response ends with a `[POINT:x,y:label]` tag, a blue triangle flies along a Bezier arc to those coordinates and shows the label.
 
 ## Requirements
 
 - **Ubuntu 22.04 / 24.04** (or any Linux running an **X11** session — not Wayland)
 - **Python 3.10+**
-- **Claude Code CLI**, already logged into a Claude Pro/Max subscription (verify: `claude -p "hi"`)
-- About 1 GB of free RAM for the whisper model + piper + claude CLI
+- Either:
+  - **Claude Code CLI**, logged into a Pro/Max subscription (verify: `claude -p "hi"`), **or**
+  - An **`ANTHROPIC_API_KEY`** environment variable set (recommended for speed + accuracy)
+- About 1 GB of free RAM for whisper + kokoro + buddy
 
 ## Install
 
@@ -164,52 +166,63 @@ On first launch the `faster-whisper base.en` model downloads into `~/.cache/hugg
 ## Architecture
 
 ```
-       ┌────────────────────┐
-       │  Ctrl+Alt+Space    │  (pynput listener thread)
-       └──────────┬─────────┘
-                  │
-        ┌─────────▼──────────┐
-        │   GTK main thread  │────► control_panel.py (floating)
-        │  + state machine   │────► overlay_window.py (full-root, transparent)
-        └─────────┬──────────┘         Cairo blue triangle + Bezier flight
-                  │
-        ┌─────────▼──────────┐
-        │  worker threads    │
-        │  (one per turn)    │
-        └─┬────────┬──────┬──┘
-          │        │      │
-   ┌──────▼──┐ ┌──▼───┐ ┌─▼──────┐
-   │ whisper │ │ffmpeg│ │ claude │
-   │ (local) │ │x11grab│ │  -p   │
-   └────┬────┘ └──┬───┘ └───┬────┘
-        │         │         │
-        └─────────┴────┬────┘
+              ┌────────────────────┐
+              │  Ctrl+Alt+Space    │  (pynput global listener)
+              └──────────┬─────────┘
+                         │
+               ┌─────────▼─────────┐
+               │   GTK main thread │──► control_panel.py (floating panel)
+               │  + state machine  │──► overlay_window.py (full-root, transparent,
+               └─────────┬─────────┘    Cairo blue triangle + Bezier flight)
+                         │
+                 ┌───────▼───────┐
+                 │ worker thread │  (one per push-to-talk turn)
+                 └──┬──────────┬─┘
+                    │          │
+          ┌─────────▼──┐   ┌───▼──────────────┐
+          │  whisper   │   │  ffmpeg x11grab  │
+          │  (local)   │   │  → 800/1568 JPEG │
+          └─────┬──────┘   └───┬──────────────┘
+                │              │
+                └──────┬───────┘
                        │
-                 ┌─────▼─────┐
-                 │   piper   │
-                 │  (local)  │
-                 └───────────┘
+               ┌───────▼────────┐
+               │    Claude      │  (make_claude() picks one)
+               │ ┌────────────┐ │
+               │ │ API (SDK)  │ │  ← when ANTHROPIC_API_KEY is set
+               │ │ or         │ │     (~1-3 s, 1568 px vision)
+               │ │ CLI (-p)   │ │  ← fallback (Claude Pro/Max sub)
+               │ └────────────┘ │     (~5-10 s, 500 px vision)
+               └───────┬────────┘
+                       │
+               ┌───────▼────────┐
+               │ TTS (make_tts) │  (kokoro by default, piper via env var)
+               └────────────────┘
 ```
 
-Only the GTK main thread mutates widgets and state. Worker threads post results back via `GLib.idle_add`. The audio callback runs on a PortAudio thread and only appends PCM to a locked bytearray.
+Only the GTK main thread mutates widgets and state. Worker threads post results back via `GLib.idle_add`. The audio input callback runs on a PortAudio thread and only appends PCM to a locked bytearray.
 
 ## Key files
 
 | File | Purpose |
 |---|---|
-| `buddy/app.py` | Top-level Adw.Application. Owns state + threads. |
-| `buddy/state_machine.py` | `IDLE → LISTENING → PROCESSING → RESPONDING → IDLE` transitions. |
+| `buddy/app.py` | Top-level Adw.Application. Owns the state machine + worker thread pipeline. |
+| `buddy/state_machine.py` | `IDLE → LISTENING → PROCESSING → RESPONDING → IDLE` transitions + observers. |
 | `buddy/hotkey.py` | Global push-to-talk listener (pynput). |
-| `buddy/audio_recorder.py` | sounddevice → int16 PCM bytes, with RMS level. |
-| `buddy/stt_whisper.py` | `faster-whisper` wrapper with warmup. |
-| `buddy/claude_adapter.py` | `claude -p` subprocess + conversation history + POINT-tag parser (regex copied verbatim from Clicky). |
-| `buddy/tts_piper.py` | Piper subprocess piped into sounddevice + interrupt. |
-| `buddy/screenshot.py` | `ffmpeg -f x11grab` + xrandr multi-monitor enumeration. |
-| `buddy/overlay_window.py` | Full-root transparent GTK4 window, Cairo triangle, quadratic Bezier flight ported from Clicky's `OverlayWindow.swift:495-568`. |
+| `buddy/audio_recorder.py` | sounddevice 48 kHz → 16 kHz decimator for whisper. |
+| `buddy/stt_whisper.py` | `faster-whisper` wrapper with background warmup. |
+| `buddy/claude_adapter.py` | Shared `ParsedResponse` / POINT parser + CLI adapter + `make_claude()` factory. |
+| `buddy/claude_api_adapter.py` | Anthropic Python SDK adapter with streaming + mid-flight cancel. |
+| `buddy/tts.py` | `make_tts()` factory (kokoro by default, piper via `BUDDY_TTS_BACKEND=piper`). |
+| `buddy/tts_kokoro.py` | Kokoro 82M (ONNX) with producer/consumer pipeline for seamless sentence playback. |
+| `buddy/tts_piper.py` | Piper subprocess → sounddevice, with interrupt. |
+| `buddy/screenshot.py` | `ffmpeg -f x11grab` + xrandr + active-window crop + 800/1568 JPEG resize. |
+| `buddy/overlay_window.py` | Full-root transparent GTK4 window, Cairo blue triangle, quadratic Bezier flight ported from Clicky's `OverlayWindow.swift`. |
 | `buddy/control_panel.py` | Small floating Adw window with state dot, transcript, response, model picker. |
-| `buddy/coords.py` | Claude-POINT → overlay-pixel coordinate mapping. |
+| `buddy/coords.py` | Claude-POINT → overlay-pixel coordinate mapping (pixel scaling + monitor offsets). |
 | `buddy/xlib_helpers.py` | Always-on-top / click-through via `_NET_WM_STATE_ABOVE` ClientMessage (ported from screen-copilot). |
-| `buddy/config.py` | Defaults + the verbatim Clicky system prompt. |
+| `buddy/config.py` | Paths, defaults, and the system prompt (Clicky's voice prompt + a narrow-tab-strip hint). |
+| `buddy/benchmark.py` | End-to-end latency benchmark with side-by-side TTS backend comparison. |
 
 ## Tests
 
@@ -218,17 +231,37 @@ pip install pytest
 pytest tests/
 ```
 
-Covers the POINT parser, multi-monitor coordinate mapping, and state machine transitions. GTK widgets and subprocess calls are not unit-tested — they're verified end-to-end by running the app.
+26 tests covering the POINT parser, multi-monitor coordinate mapping, and state machine transitions. GTK widgets and subprocess calls are verified end-to-end by running the app.
+
+## Choosing a Claude backend
+
+**Both backends are fully supported and selected automatically by `make_claude()`.**
+
+- **If `ANTHROPIC_API_KEY` is set** in the environment, buddy uses the Anthropic Python SDK directly.
+    - Higher effective vision resolution (~1568 px long edge vs. the CLI's ~500 px)
+    - Streaming responses — total turn ~3–5 s instead of ~8–13 s
+    - Cost: ~$0.0005 per turn with haiku, ~$0.002 with sonnet — practically free for personal use
+    - Get a key at https://console.anthropic.com/settings/keys, then `export ANTHROPIC_API_KEY=sk-ant-...`
+- **Otherwise** buddy falls back to the `claude -p` CLI.
+    - Works with any Claude Pro/Max subscription, no API key
+    - Images are downsized aggressively by the CLI's Read tool, limiting pointing precision on small UI elements
+    - Slower per turn due to subprocess cold-start
+
+**Short version**: if you use buddy regularly, set an API key — you get both faster turns and better pointing accuracy for essentially nothing.
+
+You can force a specific backend with `BUDDY_CLAUDE_BACKEND=cli` or `BUDDY_CLAUDE_BACKEND=api`.
 
 ## Environment variables
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `BUDDY_TTS_BACKEND` | `kokoro` | TTS backend — `kokoro` (higher quality, ~2s first-audio latency) or `piper` (faster, ~300ms first-audio, slightly robotic voice). |
-| `BUDDY_MIC_DEVICE` | auto-detects `pipewire` | Override which sounddevice input to use. Can be an integer index or a case-insensitive substring of the device name (e.g. `BUDDY_MIC_DEVICE=4` or `BUDDY_MIC_DEVICE=pipewire`). List devices with `python3 -c 'import sounddevice as sd; print(sd.query_devices())'`. |
-| `BUDDY_CAPTURE_MODE` | `auto` | Screenshot strategy. `auto` crops to the active window (better detail); set to `monitor` to force full-monitor capture across all displays. |
-| `BUDDY_SCREENSHOT_MAX_EDGE` | `800` | Max long-edge pixels for the JPEG sent to Claude. 800 is the sweet spot for the `claude -p` CLI's auto-downsize; larger values get crushed further. |
-| `BUDDY_WHISPER_MODEL` | `base.en` | Swap the whisper model — try `tiny.en` if you're low on RAM or `small.en` if you want better accuracy. |
+| `ANTHROPIC_API_KEY` | unset | Enables the Anthropic API backend. Unset = CLI fallback. |
+| `BUDDY_CLAUDE_BACKEND` | auto | Force a specific Claude backend: `api`, `cli`, or unset for auto. |
+| `BUDDY_TTS_BACKEND` | `kokoro` | `kokoro` (higher quality, ~2 s first-audio latency) or `piper` (faster, ~300 ms, slightly robotic). |
+| `BUDDY_MIC_DEVICE` | auto `pipewire` | Override which sounddevice input to use. Integer index or case-insensitive substring of the device name. List devices with `python3 -c 'import sounddevice as sd; print(sd.query_devices())'`. |
+| `BUDDY_CAPTURE_MODE` | `auto` | `auto` crops to the active window (better accuracy). Set to `monitor` to force full-monitor capture. |
+| `BUDDY_SCREENSHOT_MAX_EDGE` | 800 or 1568 | Max long-edge pixels sent to Claude. Auto-selected: 800 for CLI path, 1568 for API path. |
+| `BUDDY_WHISPER_MODEL` | `base.en` | Swap the whisper model — `tiny.en` for low RAM, `small.en` for more accuracy. |
 | `BUDDY_WHISPER_DEVICE` | `cpu` | Set to `cuda` if you have an NVIDIA GPU and `faster-whisper` picks it up. |
 | `BUDDY_WHISPER_COMPUTE` | `int8` | Whisper compute type. Use `float16` on GPU for speed. |
 | `BUDDY_PIPER_BINARY` | `piper` | Override the piper binary name/path. |
@@ -239,17 +272,16 @@ Covers the POINT parser, multi-monitor coordinate mapping, and state machine tra
 - **"whisper failed"** — the `faster-whisper` wheel sometimes needs `libstdc++6` updates. Try `pip install --upgrade faster-whisper`.
 - **Hotkey does nothing** — confirm with `echo $XDG_SESSION_TYPE` that you're on `x11`, not `wayland`. If you're on Wayland, log out and pick "Ubuntu on Xorg" at the greeter.
 - **Triangle is invisible** — your WM might not have a compositor running. On lightweight X11 setups (i3, openbox), install `picom` and run it.
-- **`claude -p` hangs** — run `claude -p "hi"` standalone first. If that hangs too, re-authenticate your Claude CLI.
-- **Triangle points to the wrong place** — Claude's vision is approximate. If it's consistently off by a lot, try switching from haiku to sonnet in the control panel.
+- **`claude -p` hangs** — run `claude -p "hi"` standalone first. If that hangs too, re-authenticate your Claude CLI, or set `ANTHROPIC_API_KEY` to switch to the API backend.
+- **Triangle points to the wrong place** — Claude's vision is approximate, and the CLI path caps it at ~500 px wide before the vision model sees it. If pointing is consistently off and you care, setting `ANTHROPIC_API_KEY` gets you ~3× more vision resolution and usually fixes it.
 - **piper binary not found** — confirm `~/.local/bin` is in `$PATH` and the binary is executable. Run `which piper` to verify.
-- **piper exits with a shared-library error** — the piper binary requires its sibling `.so` files and `espeak-ng-data/` to stay in the same directory. That's why the install instructions extract into `~/.local/share/piper/` and wrap it with a launcher script at `~/.local/bin/piper` — don't move just the binary out of the bundle.
+- **piper exits with a shared-library error** — the piper binary needs its sibling `.so` files and `espeak-ng-data/` to stay in the same directory. That's why the install extracts into `~/.local/share/piper/` with a wrapper script at `~/.local/bin/piper`.
 
 ## Limitations
 
 - **X11 only.** Wayland doesn't allow arbitrary always-on-top + click-through windows or global hotkeys without portals.
-- **Voice latency** is dominated by the `claude -p` subprocess round-trip (~1.5–4 seconds with haiku). This is why there's no streaming TTS — haiku is fast enough that a single synthesis per turn feels fine.
-- **Pointing accuracy** is whatever Claude's vision produces. There's no OCR fallback yet.
-- **English only.** Whisper model is `base.en` and piper voice is `en_US-amy-medium`. Swap them in `buddy/config.py` if you want another language.
+- **Pointing accuracy** on the CLI backend is capped by the `claude -p` Read tool's ~500 px-wide downscale. The API backend is substantially better (~1568 px) but neither is pixel-perfect — the label in the bubble is often more useful than the exact arrow position.
+- **English only by default.** Whisper model is `base.en` and the piper voice is `en_US-amy-medium`. Kokoro has multilingual voices available — swap via `buddy/tts_kokoro.py`'s `DEFAULT_VOICE_NAME` if you want another language.
 
 ## License
 

@@ -31,7 +31,7 @@ import numpy as np
 
 from buddy import config, screenshot
 from buddy.audio_recorder import _decimate_to_whisper_rate  # type: ignore
-from buddy.claude_adapter import ClaudeAdapter
+from buddy.claude_adapter import ClaudeAdapterBase, make_claude
 from buddy.stt_whisper import WhisperSTT
 
 
@@ -118,7 +118,7 @@ def bench_screenshot(monitors) -> tuple[list, float]:
     return captures, t.elapsed_ms
 
 
-def bench_claude(claude: ClaudeAdapter, transcript: str, captures) -> tuple[str, float]:
+def bench_claude(claude: ClaudeAdapterBase, transcript: str, captures) -> tuple[str, float]:
     with Timer("claude") as t:
         parsed = claude.ask(transcript, captures)
     return parsed.spoken_text, t.elapsed_ms
@@ -233,7 +233,8 @@ def run(
 
     # ── 2. Stage benchmarks (common to both TTS backends)
     monitors = screenshot.enumerate_monitors()
-    claude = ClaudeAdapter(model=claude_model)
+    claude = make_claude()
+    claude.model = claude_model
 
     if claude_warmup:
         print("\n◦ warming up claude (one throwaway call)…")

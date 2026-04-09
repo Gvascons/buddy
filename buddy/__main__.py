@@ -18,14 +18,15 @@ import time
 
 def smoke_test() -> int:
     """Minimal round-trip: record → whisper → claude → piper."""
-    from buddy import audio_recorder, claude_adapter, stt_whisper, tts_piper
+    from buddy import audio_recorder, stt_whisper, tts_piper
+    from buddy.claude_adapter import make_claude
 
     print("🎙  buddy smoke test — record 5 seconds after the beep.")
     print("    (loads whisper first, which can take a few seconds)")
     whisper = stt_whisper.WhisperSTT()
     whisper.warmup()
 
-    claude = claude_adapter.ClaudeAdapter()
+    claude = make_claude()
     tts = tts_piper.PiperTTS()
 
     recorder = audio_recorder.AudioRecorder()
@@ -107,6 +108,7 @@ def doctor() -> int:
         ("Xlib", "python-xlib"),
         ("PIL", "Pillow"),
         ("kokoro_onnx", "kokoro-onnx"),
+        ("anthropic", "anthropic"),
     ]:
         try:
             __import__(module)
@@ -117,8 +119,8 @@ def doctor() -> int:
 
     # TTS model files — only require the files for whichever backend is active
     from buddy import config as buddy_config
-    active_backend = os.environ.get("BUDDY_TTS_BACKEND", "kokoro").strip().lower()
-    if active_backend == "piper":
+    tts_backend = os.environ.get("BUDDY_TTS_BACKEND", "kokoro").strip().lower()
+    if tts_backend == "piper":
         if buddy_config.PIPER_MODEL_PATH.exists():
             print(f"  ✅ piper voice    {buddy_config.PIPER_MODEL_PATH}")
         else:
@@ -136,6 +138,17 @@ def doctor() -> int:
         else:
             print(f"  ❌ kokoro voices  MISSING at {DEFAULT_VOICES}")
             problems.append("kokoro voices file")
+
+    # Claude backend selection
+    forced = os.environ.get("BUDDY_CLAUDE_BACKEND", "").strip().lower()
+    has_key = bool(os.environ.get("ANTHROPIC_API_KEY"))
+    if forced == "cli" or (not has_key and forced != "api"):
+        print("  ✅ claude backend API path not active — using `claude -p` CLI (Claude Pro/Max)")
+    elif has_key:
+        print("  ✅ claude backend Anthropic API (ANTHROPIC_API_KEY detected)")
+    else:
+        print("  ⚠️ claude backend forced to API but ANTHROPIC_API_KEY not set")
+        problems.append("ANTHROPIC_API_KEY")
 
     # $DISPLAY
     if os.environ.get("DISPLAY"):

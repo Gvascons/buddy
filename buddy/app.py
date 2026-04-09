@@ -3,7 +3,8 @@
 Owns:
 - StateMachine
 - WhisperSTT (loaded in a background thread on startup)
-- ClaudeAdapter
+- Claude backend (selected by make_claude() — API if ANTHROPIC_API_KEY
+  is set, else the `claude -p` CLI)
 - TTS backend (selected by make_tts() based on BUDDY_TTS_BACKEND)
 - AudioRecorder
 - GlobalPushToTalk
@@ -27,7 +28,7 @@ from gi.repository import Adw, GLib  # noqa: E402
 
 from buddy import config, coords
 from buddy.audio_recorder import AudioRecorder
-from buddy.claude_adapter import ClaudeAdapter
+from buddy.claude_adapter import make_claude
 from buddy.control_panel import ControlPanel
 from buddy.hotkey import GlobalPushToTalk
 from buddy.overlay_window import CursorOverlay
@@ -45,7 +46,7 @@ class BuddyApp:
         # Core components (constructed in _on_activate so GTK is ready)
         self.state = StateMachine()
         self.recorder = AudioRecorder()
-        self.claude = ClaudeAdapter()
+        self.claude = make_claude()
         self.tts = make_tts()
         self.whisper: WhisperSTT | None = None
         self.monitors = enumerate_monitors()
@@ -278,12 +279,8 @@ class BuddyApp:
             parsed = self.claude.ask(transcript, captures)
             print(f"💬 claude: {parsed.spoken_text!r}")
             if parsed.has_coordinate:
-                if parsed.cell is not None:
-                    coord_str = f"cell {parsed.cell}"
-                else:
-                    coord_str = f"pixel ({parsed.point_x},{parsed.point_y})"
                 print(
-                    f"   pointing at {coord_str} "
+                    f"   pointing at pixel ({parsed.point_x},{parsed.point_y}) "
                     f"{parsed.label!r} screen={parsed.screen_number}"
                 )
 

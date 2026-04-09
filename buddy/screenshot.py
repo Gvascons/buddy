@@ -31,12 +31,32 @@ from buddy.claude_adapter import ScreenCapture
 
 DISPLAY = os.environ.get("DISPLAY", ":0")
 
-# Pre-resize target for images sent to Claude. The `claude -p --tools Read`
-# harness downsizes any image aggressively — but empirical testing shows
-# that anything ≤800 px on the long edge survives at 1:1 resolution, while
-# anything larger gets at least 2× further downsized. So we cap the long
-# edge at 800 and save as JPEG quality 92 to keep file size small.
-CLAUDE_MAX_LONG_EDGE = int(os.environ.get("BUDDY_SCREENSHOT_MAX_EDGE", "800"))
+# Pre-resize target for images sent to Claude.
+#
+# The `claude -p --tools Read` CLI aggressively downsizes any image
+# before the vision model sees it. Empirical sweep: images ≤800 px
+# on the long edge survive at 1:1, anything larger gets ≥2× further
+# downsized. So for the CLI backend the sweet spot is 800.
+#
+# The Anthropic API path downsizes to ~1568 long edge internally
+# (the "high detail" budget), so for the API backend we send larger
+# images for more pointing precision.
+#
+# Selection is driven by the active backend — we inspect the
+# ANTHROPIC_API_KEY env var (same logic as make_claude()), because
+# importing the backend class at module import time would create a
+# circular dependency with claude_adapter.
+_USING_API = (
+    os.environ.get("BUDDY_CLAUDE_BACKEND", "").strip().lower() == "api"
+    or bool(os.environ.get("ANTHROPIC_API_KEY"))
+)
+if os.environ.get("BUDDY_CLAUDE_BACKEND", "").strip().lower() == "cli":
+    _USING_API = False
+
+_DEFAULT_MAX_EDGE = 1568 if _USING_API else 800
+CLAUDE_MAX_LONG_EDGE = int(
+    os.environ.get("BUDDY_SCREENSHOT_MAX_EDGE", str(_DEFAULT_MAX_EDGE))
+)
 JPEG_QUALITY = 92
 
 
@@ -204,18 +224,14 @@ def _resize_for_claude(png_path: Path, jpg_path: Path) -> tuple[int, int]:
     """Resize the PNG at `png_path` to ≤CLAUDE_MAX_LONG_EDGE long edge
     and save as JPEG at `jpg_path`. Returns (out_width, out_height).
 
-    We use Pillow with LANCZOS resampling for quality. If the source
-    is already under the cap we still re-save as JPEG to benefit from
-    the smaller file size (Claude CLI seems to downsize PNG more
-    aggressively than JPEG at similar absolute pixel counts).
-
-    When config.GRID_ENABLED is True, we also overlay a labeled grid
-    on the final JPEG (Set-of-Marks prompting — see _draw_som_grid).
+    Uses Pillow with LANCZOS resampling. Even if the source is already
+    under the cap we re-save as JPEG since JPEG compresses better for
+    our screenshots and survives downstream processing more reliably.
     """
     from PIL import Image
 
     with Image.open(png_path) as img:
-        img.load()  # force decode before we mess with the file
+        img.load()  # force decode before we touch the file
         w, h = img.size
         long_edge = max(w, h)
         if long_edge > CLAUDE_MAX_LONG_EDGE:
@@ -226,82 +242,14 @@ def _resize_for_claude(png_path: Path, jpg_path: Path) -> tuple[int, int]:
         else:
             new_w, new_h = w, h
             resized = img.copy()
-        # JPEG wants RGB, not RGBA
         if resized.mode != "RGB":
             resized = resized.convert("RGB")
-        if config.GRID_ENABLED:
-            resized = _draw_som_grid(resized, config.GRID_ROWS, config.GRID_COLS)
         resized.save(jpg_path, "JPEG", quality=JPEG_QUALITY, optimize=True)
     try:
         png_path.unlink()
     except FileNotFoundError:
         pass
     return new_w, new_h
-
-
-def _draw_som_grid(img, rows: int, cols: int):
-    """Overlay a labeled Set-of-Marks grid on the given Pillow image.
-
-    Returns a new RGB Pillow image with thin translucent grid lines
-    and cell labels ("A1", "B1", ..., up to the Nth row and Mth column).
-    Claude's vision model is much better at identifying labeled cells
-    than at returning raw pixel coordinates, so this overlay is the
-    single biggest accuracy boost available without a round-trip
-    second Claude call.
-    """
-    from PIL import Image, ImageDraw, ImageFont
-
-    rgba = img.convert("RGBA")
-    overlay = Image.new("RGBA", rgba.size, (0, 0, 0, 0))
-    draw = ImageDraw.Draw(overlay)
-
-    width, height = rgba.size
-    cell_w = width / cols
-    cell_h = height / rows
-
-    # Grid lines — thin, semi-transparent lime
-    line_color = (50, 255, 120, 170)
-    for r in range(1, rows):
-        y = int(round(r * cell_h))
-        draw.line([(0, y), (width, y)], fill=line_color, width=1)
-    for c in range(1, cols):
-        x = int(round(c * cell_w))
-        draw.line([(x, 0), (x, height)], fill=line_color, width=1)
-
-    # Pick a readable font. Try DejaVu first (ubuntu default), fall
-    # back to Pillow's bitmap default if not available.
-    try:
-        font = ImageFont.truetype(
-            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 11,
-        )
-    except (OSError, IOError):
-        try:
-            font = ImageFont.truetype("DejaVuSans-Bold.ttf", 11)
-        except (OSError, IOError):
-            font = ImageFont.load_default()
-
-    # Cell labels — top-left of each cell, with a dark backdrop so
-    # they're readable against any background.
-    label_bg = (0, 0, 0, 180)
-    label_fg = (230, 255, 230, 255)
-    for r in range(rows):
-        for c in range(cols):
-            label = f"{chr(ord('A') + c)}{r + 1}"
-            x = int(round(c * cell_w)) + 3
-            y = int(round(r * cell_h)) + 1
-            # Measure text so the backdrop is tight
-            try:
-                bbox = draw.textbbox((x, y), label, font=font)
-            except AttributeError:
-                # Older Pillow fallback
-                text_w, text_h = draw.textsize(label, font=font)  # type: ignore
-                bbox = (x, y, x + text_w, y + text_h)
-            padded = (bbox[0] - 1, bbox[1] - 1, bbox[2] + 1, bbox[3] + 1)
-            draw.rectangle(padded, fill=label_bg)
-            draw.text((x, y), label, fill=label_fg, font=font)
-
-    composited = Image.alpha_composite(rgba, overlay).convert("RGB")
-    return composited
 
 
 # ────────────────────────────────────────────────────────────────────
@@ -419,7 +367,7 @@ def active_window() -> ActiveWindow | None:
     # ffmpeg's x11grab refuses to capture outside the root window,
     # so without this clamp the active-window crop silently fails and
     # falls back to full-monitor mode — which defeats the whole point
-    # of cropping for better SoM resolution.
+    # of cropping to the active app for better Claude vision resolution.
     monitors = enumerate_monitors()
     if monitors:
         root_min_x = min(m.x for m in monitors)
@@ -504,16 +452,10 @@ def capture_active_window(
         print(f"⚠️ screenshot: resize failed: {exc}")
         return []
 
-    grid_note = (
-        f" a {config.GRID_COLS}x{config.GRID_ROWS} labeled grid is "
-        f"overlaid on this image."
-        if config.GRID_ENABLED else ""
-    )
     label = (
         f'cropped to the active application window "{window.title or "(untitled)"}" '
         f"(image dimensions: {claude_w}x{claude_h} pixels). "
         "this is the full screenshot — there is nothing outside this crop."
-        f"{grid_note}"
     )
 
     return [ScreenCapture(
@@ -596,15 +538,9 @@ def capture_all_monitors(
 
         is_cursor = (mon is cursor_mon)
         focus_note = " — cursor is on this screen (primary focus)" if is_cursor else ""
-        grid_note = (
-            f" a {config.GRID_COLS}x{config.GRID_ROWS} labeled grid is "
-            f"overlaid on this image."
-            if config.GRID_ENABLED else ""
-        )
         label = (
             f"screen {idx} of {total} ({mon.name}){focus_note} "
             f"(image dimensions: {claude_w}x{claude_h} pixels)."
-            f"{grid_note}"
         )
         captures.append(ScreenCapture(
             image_path=str(jpg_path),

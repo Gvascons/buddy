@@ -1,14 +1,31 @@
-"""Claude CLI adapter.
+"""Claude backend types and CLI adapter + factory.
 
-Shells out to `claude -p` (Claude Code CLI, authenticated via the user's
-Claude MAX subscription — no API keys required). Sends multi-image
-prompts by embedding paths in the prompt text and using `--tools read`
-so the CLI reads the screenshots itself. Parses Clicky-style
-`[POINT:x,y:label:screenN]` tags out of the response.
+buddy supports two interchangeable Claude backends:
+
+- **CLI** (`claude -p` subprocess) — works with a Claude MAX / Pro
+  subscription, no API key required. The CLI's Read tool aggressively
+  downsizes images to ~500 pixels on the long edge before the vision
+  model sees them, which caps pointing precision on small UI
+  elements.
+- **API** (Anthropic Python SDK) — uses your `ANTHROPIC_API_KEY` to
+  talk to the Messages API directly. Images go through as base64
+  content blocks at full resolution, letting Claude see up to
+  ~1568 px on the long edge. 3× better pointing accuracy in
+  practice, and much lower latency.
+
+`make_claude()` picks automatically based on whether
+`ANTHROPIC_API_KEY` is set in the environment.
+
+Both backends share:
+- `ParsedResponse` / `parse_point` for POINT tag parsing
+- `ScreenCapture` for describing captured screenshots
+- `ClaudeAdapterBase` for history management + prompt building
+- `ClaudeCancelled` exception for mid-turn interrupts
 """
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import threading
@@ -19,96 +36,71 @@ from buddy import config
 
 
 # ────────────────────────────────────────────────────────────────────
-# POINT tag parser — based on the Clicky project's regex
-# (leanring-buddy/CompanionManager.swift, parsePointingCoordinates)
-# with a Set-of-Marks cell variant added on top.
+# POINT tag parser — Clicky-style raw pixel coordinates.
+# Regex originally copied from Clicky's CompanionManager.swift parse
+# routine; simplified to just the pixel form after proving that
+# Set-of-Marks grid-cell pointing is less accurate in practice on the
+# CLI path (see git history for the experiment).
 # See https://github.com/farzaa/clicky
-#
-# Accepts three formats:
-#   [POINT:none]                         — no pointing needed
-#   [POINT:123,456:label:screen2]        — raw pixel coords (classic)
-#   [POINT:H6:label:screen2]             — grid cell name (SoM)
-# The label and screen suffix are optional in all coord variants.
 # ────────────────────────────────────────────────────────────────────
 
 POINT_REGEX = re.compile(
     r"\[POINT:"
-    r"(?:"
-    r"none"                                      # [POINT:none]
-    r"|(?P<x>\d+)\s*,\s*(?P<y>\d+)"              # raw pixels
-    r"|(?P<cell>[A-Z]\d+)"                       # cell name, e.g. "H6"
-    r")"
-    r"(?::(?P<label>[^\]:\s][^\]:]*?))?"         # optional label
-    r"(?::screen(?P<screen>\d+))?"               # optional :screenN
+    r"(?:none|(?P<x>\d+)\s*,\s*(?P<y>\d+))"           # either 'none' or x,y pixel integers
+    r"(?::(?P<label>[^\]:\s][^\]:]*?))?"              # optional short label
+    r"(?::screen(?P<screen>\d+))?"                    # optional :screenN
     r"\]\s*$"
 )
 
 
 class ClaudeCancelled(Exception):
-    """Raised when an in-flight claude -p call is interrupted by cancel()."""
+    """Raised when an in-flight Claude call is interrupted by `cancel()`."""
 
 
 @dataclass
 class ParsedResponse:
     """A Claude response with the POINT tag (if any) extracted.
 
-    At most ONE of `(point_x, point_y)` or `cell` is populated:
-    - When Claude returns pixel coordinates, point_x/point_y are set.
-    - When Claude returns a grid cell (Set-of-Marks mode), cell is set.
-    - When there's no coordinate at all (or [POINT:none]), both are
-      None and has_coordinate returns False.
-
-    coords.resolve_point() translates either form into overlay-local
-    pixel coordinates using the target ScreenCapture's dimensions.
+    `has_coordinate` is True when Claude emitted a real x/y pixel pair.
+    `label="none"` with no coordinate means Claude explicitly said
+    `[POINT:none]` (no pointing appropriate). Missing POINT tag leaves
+    everything None except spoken_text.
     """
-    spoken_text: str                # response with POINT tag stripped, trimmed
-    point_x: int | None = None      # screenshot pixel x (raw-pixel mode)
-    point_y: int | None = None      # screenshot pixel y (raw-pixel mode)
-    cell: str | None = None         # grid cell label, e.g. "H6" (SoM mode)
-    label: str | None = None        # short description of the element, or "none"
-    screen_number: int | None = None  # 1-based; None means cursor screen
+    spoken_text: str
+    point_x: int | None = None
+    point_y: int | None = None
+    label: str | None = None
+    screen_number: int | None = None
 
     @property
     def has_coordinate(self) -> bool:
-        if self.cell is not None:
-            return True
         return self.point_x is not None and self.point_y is not None
 
 
 def parse_point(response_text: str) -> ParsedResponse:
     """Extract the trailing POINT tag from a Claude response.
 
-    Returns the spoken text (tag removed, whitespace trimmed) plus
-    parsed coordinate fields. Supports three formats:
+    Supported forms:
+      [POINT:none]
+      [POINT:x,y:label:screenN]    (label and :screenN are optional)
 
-      [POINT:none]                  → label="none", no coordinate
-      [POINT:123,456:label:screenN] → point_x/point_y set
-      [POINT:H6:label:screenN]      → cell set
-
-    Responses with no tag come back with all POINT fields None.
+    Returns a ParsedResponse with the POINT tag stripped from the
+    `spoken_text`. Responses with no tag come back with everything
+    None except spoken_text.
     """
     match = POINT_REGEX.search(response_text)
     if not match:
         return ParsedResponse(spoken_text=response_text.strip())
 
     spoken = response_text[: match.start()].strip()
-
     x_group = match.group("x")
     y_group = match.group("y")
-    cell_group = match.group("cell")
     label_group = match.group("label")
     screen_group = match.group("screen")
 
     label = label_group.strip() if label_group else None
     screen = int(screen_group) if screen_group else None
 
-    if cell_group is not None:
-        return ParsedResponse(
-            spoken_text=spoken,
-            cell=cell_group,
-            label=label,
-            screen_number=screen,
-        )
     if x_group is not None and y_group is not None:
         return ParsedResponse(
             spoken_text=spoken,
@@ -117,14 +109,45 @@ def parse_point(response_text: str) -> ParsedResponse:
             label=label,
             screen_number=screen,
         )
-    # [POINT:none] — matched, but no coordinate capture fired
+    # [POINT:none] matched but no coordinate groups fired
     return ParsedResponse(spoken_text=spoken, label="none")
 
 
 # ────────────────────────────────────────────────────────────────────
-# Claude CLI output scrubbing
-# Ported from the screen-copilot project's response cleanup.
-# See https://github.com/Gvascons/screen-copilot
+# Screenshot handle — passed from screenshot.py to Claude adapters
+# ────────────────────────────────────────────────────────────────────
+
+@dataclass
+class ScreenCapture:
+    """One screenshot as passed to a Claude adapter.
+
+    `width`/`height` are the dimensions of the saved JPEG, which is
+    the coordinate space Claude's POINT(x,y) tags operate in.
+
+    `source_width`/`source_height` are the dimensions of the original
+    region that was cropped (the active window or the monitor). If the
+    image was resized before being handed to Claude, these two pairs
+    differ and `coords.resolve_point()` scales by the ratio.
+
+    `monitor_x`/`monitor_y` are the root-window coordinates of the
+    top-left of that source region. Adding them to a scaled-back
+    POINT gives the root-window pixel to fly the cursor to.
+    """
+    image_path: str
+    label: str
+    width: int
+    height: int
+    source_width: int
+    source_height: int
+    monitor_index: int
+    monitor_x: int
+    monitor_y: int
+    is_cursor_screen: bool
+
+
+# ────────────────────────────────────────────────────────────────────
+# CLI output scrubbing — the `claude -p` CLI sometimes leaks tool-use
+# XML tags and stray base64 into stdout. Only used by the CLI adapter.
 # ────────────────────────────────────────────────────────────────────
 
 _XML_TAG_RE = re.compile(r"<[^>]*>")
@@ -132,67 +155,28 @@ _BASE64_BLOB_RE = re.compile(r"[A-Za-z0-9+/]{80,}={0,2}")
 
 
 def _scrub_cli_artifacts(text: str) -> str:
-    """Remove tool-use tags and stray base64 that sometimes leak into stdout."""
     text = _XML_TAG_RE.sub("", text)
     text = _BASE64_BLOB_RE.sub("", text)
     return text.strip()
 
 
 # ────────────────────────────────────────────────────────────────────
-# Screenshot handle
+# Shared base class for Claude adapters
 # ────────────────────────────────────────────────────────────────────
 
-@dataclass
-class ScreenCapture:
-    """One screenshot as passed to Claude.
-
-    `width` / `height` are the dimensions of the image file on disk AND
-    the coordinate space Claude's POINT(x,y) tags operate in — they
-    must match the dimensions embedded in the label.
-
-    `source_width` / `source_height` are the dimensions of the original
-    region that was cropped (the app window or the monitor). If the
-    image was resized before being handed to Claude, these two pairs
-    differ and `coords.resolve_point()` scales by the ratio.
-
-    `monitor_x` / `monitor_y` are the root-window coordinates of the
-    top-left corner of that *source* region — adding them to the
-    scaled-back POINT gives the root-window pixel to fly the cursor to.
+class ClaudeAdapterBase:
+    """Shared history tracking, prompt building, and cancellation
+    bookkeeping. Subclasses override `ask()` and `cancel()`.
     """
-    image_path: str
-    label: str              # "cropped to the active application window ... (image dimensions: 800x533 pixels)"
-    width: int              # pixels of the saved screenshot (Claude's POINT space)
-    height: int
-    source_width: int       # pixels of the original unresized crop
-    source_height: int
-    monitor_index: int      # 1-based, matches :screenN tag
-    monitor_x: int          # root-window offset of the source region
-    monitor_y: int
-    is_cursor_screen: bool
 
-
-# ────────────────────────────────────────────────────────────────────
-# Claude CLI driver
-# ────────────────────────────────────────────────────────────────────
-
-class ClaudeAdapter:
     def __init__(
         self,
         model: str = config.DEFAULT_CLAUDE_MODEL,
         max_history: int = config.MAX_HISTORY_EXCHANGES,
-        binary: str = "claude",
-        timeout_seconds: float = 120.0,
     ) -> None:
         self.model = model
         self._max_history = max_history
-        self._binary = binary
-        self._timeout = timeout_seconds
-        # [(user_transcript, assistant_spoken_text), ...]
         self._history: list[tuple[str, str]] = []
-        # In-flight subprocess so cancel() can kill it from the hotkey
-        # handler when the user interrupts mid-turn.
-        self._current_proc: subprocess.Popen | None = None
-        self._proc_lock = threading.Lock()
         self._cancelled = threading.Event()
 
     # ── history ──────────────────────────────────────────────────────
@@ -203,12 +187,16 @@ class ClaudeAdapter:
     def history_length(self) -> int:
         return len(self._history)
 
+    def _record_turn(self, user_transcript: str, assistant_spoken: str) -> None:
+        self._history.append((user_transcript, assistant_spoken))
+        if len(self._history) > self._max_history:
+            self._history = self._history[-self._max_history:]
+
     def _build_history_block(self) -> str:
         if not self._history:
             return ""
         lines = []
         for user_text, assistant_text in self._history:
-            # Truncate long assistant turns so the context stays small.
             trimmed = assistant_text
             if len(trimmed) > 800:
                 trimmed = trimmed[:800] + "…"
@@ -216,11 +204,47 @@ class ClaudeAdapter:
             lines.append(f"[previous you]: {trimmed}")
         return "conversation so far:\n" + "\n".join(lines) + "\n\n---\n\n"
 
+    # ── subclass hooks ───────────────────────────────────────────────
+
+    def ask(
+        self,
+        transcript: str,
+        captures: Sequence[ScreenCapture] = (),
+    ) -> ParsedResponse:
+        raise NotImplementedError
+
+    def cancel(self) -> None:
+        self._cancelled.set()
+
+
+# ────────────────────────────────────────────────────────────────────
+# CLI adapter — `claude -p` subprocess
+# ────────────────────────────────────────────────────────────────────
+
+class ClaudeCLIAdapter(ClaudeAdapterBase):
+    """Uses the `claude -p` subprocess. No API key required — works
+    with any Claude Pro/Max subscription. Slower (~8 s per turn
+    including subprocess cold-start) and vision is capped at ~500 px
+    wide after the CLI's internal downscale.
+    """
+
+    def __init__(
+        self,
+        model: str = config.DEFAULT_CLAUDE_MODEL,
+        max_history: int = config.MAX_HISTORY_EXCHANGES,
+        binary: str = "claude",
+        timeout_seconds: float = 120.0,
+    ) -> None:
+        super().__init__(model=model, max_history=max_history)
+        self._binary = binary
+        self._timeout = timeout_seconds
+        self._current_proc: subprocess.Popen | None = None
+        self._proc_lock = threading.Lock()
+
     # ── prompt construction ──────────────────────────────────────────
 
     def _build_prompt(self, transcript: str, captures: Sequence[ScreenCapture]) -> str:
         history_block = self._build_history_block()
-
         if captures:
             image_lines = ["screenshots for this turn:"]
             for cap in captures:
@@ -229,7 +253,6 @@ class ClaudeAdapter:
             image_block = "\n".join(image_lines) + "\n\n"
         else:
             image_block = ""
-
         return (
             f"{history_block}"
             f"{image_block}"
@@ -246,16 +269,7 @@ class ClaudeAdapter:
         transcript: str,
         captures: Sequence[ScreenCapture] = (),
     ) -> ParsedResponse:
-        """Send one turn to Claude. Blocks until the subprocess returns
-        or `cancel()` is called on another thread.
-
-        Raises RuntimeError on nonzero exit code, TimeoutError on hard
-        timeout, and ClaudeCancelled when interrupted mid-flight.
-
-        Must be called from a worker thread, not the GTK main thread.
-        """
         prompt = self._build_prompt(transcript, captures)
-
         cmd = [
             self._binary, "-p",
             "--model", self.model,
@@ -265,9 +279,10 @@ class ClaudeAdapter:
             prompt,
         ]
 
-        print(f"🤖 claude: asking ({self.model}, {len(captures)} images, {len(self._history)} history)")
-
-        # Reset the cancel flag so a previous cancel doesn't affect us.
+        print(
+            f"🤖 claude-cli: asking ({self.model}, {len(captures)} images, "
+            f"{len(self._history)} history)"
+        )
         self._cancelled.clear()
 
         proc = subprocess.Popen(
@@ -302,22 +317,11 @@ class ClaudeAdapter:
 
         raw_text = _scrub_cli_artifacts(stdout)
         parsed = parse_point(raw_text)
-
-        # Save to history using the stripped spoken text (no POINT tag).
-        self._history.append((transcript, parsed.spoken_text))
-        if len(self._history) > self._max_history:
-            self._history = self._history[-self._max_history:]
-
+        self._record_turn(transcript, parsed.spoken_text)
         return parsed
 
     def cancel(self) -> None:
-        """Kill any in-flight `claude -p` subprocess. Safe from any thread.
-
-        Sets an internal flag so the ask() call can distinguish a
-        user-triggered cancellation from a normal subprocess failure,
-        and raise ClaudeCancelled instead of RuntimeError.
-        """
-        self._cancelled.set()
+        super().cancel()
         with self._proc_lock:
             proc = self._current_proc
         if proc is not None and proc.poll() is None:
@@ -325,3 +329,40 @@ class ClaudeAdapter:
                 proc.kill()
             except Exception:
                 pass
+
+
+# ────────────────────────────────────────────────────────────────────
+# Backend factory
+# ────────────────────────────────────────────────────────────────────
+
+def make_claude() -> ClaudeAdapterBase:
+    """Construct the best available Claude backend.
+
+    - If `ANTHROPIC_API_KEY` is set in the environment and the
+      `anthropic` SDK is importable, returns the API adapter.
+    - Otherwise falls back to the `claude -p` CLI adapter.
+
+    Override `BUDDY_CLAUDE_BACKEND=cli` to force the CLI path even
+    with an API key set.
+    """
+    forced = os.environ.get("BUDDY_CLAUDE_BACKEND", "").strip().lower()
+    has_key = bool(os.environ.get("ANTHROPIC_API_KEY"))
+
+    if forced == "cli":
+        print("🤖 claude: forced CLI backend (BUDDY_CLAUDE_BACKEND=cli)")
+        return ClaudeCLIAdapter()
+    if forced == "api" or has_key:
+        try:
+            from buddy.claude_api_adapter import ClaudeAPIAdapter
+            print(
+                "🤖 claude: using Anthropic API (higher vision resolution, "
+                "faster turns — via ANTHROPIC_API_KEY)"
+            )
+            return ClaudeAPIAdapter()
+        except ImportError as exc:
+            print(
+                f"⚠️ claude: anthropic SDK not available ({exc}), "
+                f"falling back to CLI"
+            )
+    print("🤖 claude: using `claude -p` CLI (works with any Claude Pro/Max sub)")
+    return ClaudeCLIAdapter()
