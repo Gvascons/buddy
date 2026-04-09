@@ -46,6 +46,12 @@ class PiperTTS:
     def is_available(self) -> bool:
         return self._model_path.exists()
 
+    def warmup(self) -> None:
+        """No-op for piper — subprocess spawn is the only cost, and
+        there's nothing persistent to keep loaded between turns.
+        """
+        pass
+
     def speak(
         self,
         text: str,

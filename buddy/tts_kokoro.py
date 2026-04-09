@@ -88,6 +88,24 @@ class KokoroTTS:
             self._engine = Kokoro(str(self._model_path), str(self._voices_path))
             print("🧠 kokoro: ready")
 
+    def warmup(self) -> None:
+        """Load the model and run one trivial synthesis so the first
+        real `speak()` call doesn't pay any graph-compile cost.
+
+        Safe to call from a background thread at app startup — the
+        engine-load is guarded by a lock so concurrent speak() calls
+        on the main worker will just wait.
+        """
+        self._ensure_engine()
+        if self._engine is None:
+            return
+        try:
+            # One silent throwaway synthesis to JIT the onnx graph.
+            self._engine.create("ready.", voice=self._voice, lang=self._lang)
+            print("🔊 kokoro: warmed up")
+        except Exception as exc:
+            print(f"⚠️ kokoro warmup failed: {exc}")
+
     def speak(
         self,
         text: str,

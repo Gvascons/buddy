@@ -74,6 +74,7 @@ def smoke_test() -> int:
 
 def doctor() -> int:
     """Verify dependencies — print what's missing, exit 0 if all good."""
+    import os
     import shutil
 
     print("🩺 buddy doctor")
@@ -105,6 +106,7 @@ def doctor() -> int:
         ("pynput", "pynput"),
         ("Xlib", "python-xlib"),
         ("PIL", "Pillow"),
+        ("kokoro_onnx", "kokoro-onnx"),
     ]:
         try:
             __import__(module)
@@ -113,16 +115,29 @@ def doctor() -> int:
             print(f"  ❌ python:{module:15s}  MISSING    — pip install {pip_name}")
             problems.append(pip_name)
 
-    # Piper voice model
+    # TTS model files — only require the files for whichever backend is active
     from buddy import config as buddy_config
-    if buddy_config.PIPER_MODEL_PATH.exists():
-        print(f"  ✅ piper voice    {buddy_config.PIPER_MODEL_PATH}")
+    active_backend = os.environ.get("BUDDY_TTS_BACKEND", "kokoro").strip().lower()
+    if active_backend == "piper":
+        if buddy_config.PIPER_MODEL_PATH.exists():
+            print(f"  ✅ piper voice    {buddy_config.PIPER_MODEL_PATH}")
+        else:
+            print(f"  ❌ piper voice    MISSING at {buddy_config.PIPER_MODEL_PATH}")
+            problems.append("piper voice model")
     else:
-        print(f"  ❌ piper voice    MISSING at {buddy_config.PIPER_MODEL_PATH}")
-        problems.append("piper voice model")
+        from buddy.tts_kokoro import DEFAULT_MODEL, DEFAULT_VOICES
+        if DEFAULT_MODEL.exists():
+            print(f"  ✅ kokoro model   {DEFAULT_MODEL}")
+        else:
+            print(f"  ❌ kokoro model   MISSING at {DEFAULT_MODEL}")
+            problems.append("kokoro onnx model")
+        if DEFAULT_VOICES.exists():
+            print(f"  ✅ kokoro voices  {DEFAULT_VOICES}")
+        else:
+            print(f"  ❌ kokoro voices  MISSING at {DEFAULT_VOICES}")
+            problems.append("kokoro voices file")
 
     # $DISPLAY
-    import os
     if os.environ.get("DISPLAY"):
         print(f"  ✅ $DISPLAY       {os.environ['DISPLAY']}")
     else:

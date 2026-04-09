@@ -99,11 +99,22 @@ class BuddyApp:
         )
         self.hotkey.start()
 
-        # Warm whisper in the background so startup isn't blocking
+        # Warm whisper in the background so startup isn't blocking.
         threading.Thread(
             target=self._load_and_warm_whisper,
             daemon=True,
             name="whisper-warmup",
+        ).start()
+
+        # Warm the TTS engine in parallel so the first push-to-talk
+        # doesn't pay the model-load + graph-compile cost on top of
+        # everything else. This is especially important for kokoro,
+        # whose onnx graph compilation adds ~300-500ms to the first
+        # synthesis.
+        threading.Thread(
+            target=self._warm_tts,
+            daemon=True,
+            name="tts-warmup",
         ).start()
 
     def _hide_overlay_initially(self) -> bool:
@@ -142,6 +153,15 @@ class BuddyApp:
             GLib.idle_add(self._update_status, "ready — hold ctrl+alt+space to speak")
         except Exception as exc:
             GLib.idle_add(self._update_status, f"whisper failed: {exc}")
+
+    def _warm_tts(self) -> None:
+        """Preload + warmup the TTS backend in a background thread so
+        the first real speak() call doesn't pay the model-load cost.
+        """
+        try:
+            self.tts.warmup()
+        except Exception as exc:
+            print(f"⚠️ tts warmup failed: {exc}")
 
     def _update_status(self, text: str) -> bool:
         if self.control_panel is not None:

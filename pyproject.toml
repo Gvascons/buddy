@@ -20,6 +20,7 @@ dependencies = [
     "pynput>=1.7",
     "python-xlib>=0.33",
     "Pillow>=9.0",
+    "kokoro-onnx>=0.5.0",
 ]
 
 [project.optional-dependencies]

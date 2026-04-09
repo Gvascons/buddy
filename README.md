@@ -46,7 +46,44 @@ pip install -e .
 
 The `--system-site-packages` flag is important so the venv can see `python3-gi`.
 
-### 3. Piper TTS (one-time download)
+### 3. TTS
+
+buddy ships with two local TTS backends and picks one at startup via
+the `BUDDY_TTS_BACKEND` env var:
+
+| Backend | Default? | Quality | Time to first audio | Notes |
+|---|---|---|---|---|
+| **Kokoro 82M** (`kokoro`) | **Yes** | Very natural | ~2 s on CPU | Apache 2.0, runs via `kokoro-onnx`, no PyTorch needed |
+| Piper (`piper`) | no | Slightly robotic | ~300 ms on CPU | Very responsive, fast to synthesize |
+
+You can use either one. If you just want to try buddy quickly, piper is
+simpler to install (no Python dependency on `kokoro-onnx`) and will
+feel snappier. If you want the best voice quality and are willing to
+wait ~2 seconds extra per turn, use kokoro (the default).
+
+#### 3a. Kokoro (default backend)
+
+`pip install -e .` already pulled in `kokoro-onnx`. You just need the
+model files:
+
+```bash
+mkdir -p ~/.local/share/buddy/kokoro
+
+# 82M int8 ONNX model (~89 MB) — runs on CPU via onnxruntime
+curl -L -o ~/.local/share/buddy/kokoro/kokoro-v1.0.int8.onnx \
+    https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/kokoro-v1.0.int8.onnx
+
+# Voice embeddings (~27 MB) — 54 speakers, multiple languages
+curl -L -o ~/.local/share/buddy/kokoro/voices-v1.0.bin \
+    https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0/voices-v1.0.bin
+```
+
+buddy uses the `af_heart` voice by default (warm American female).
+Change it by editing `DEFAULT_VOICE_NAME` in `buddy/tts_kokoro.py` —
+the full list of 54 voices is available via
+`python3 -c "from kokoro_onnx import Kokoro; k = Kokoro('~/.local/share/buddy/kokoro/kokoro-v1.0.int8.onnx', '~/.local/share/buddy/kokoro/voices-v1.0.bin'); print(k.get_voices())"`.
+
+#### 3b. Piper (optional, faster)
 
 `piper` is not in `apt`. The binary ships with shared libraries and an
 `espeak-ng-data/` directory that must stay next to it, so we install the
@@ -187,7 +224,10 @@ Covers the POINT parser, multi-monitor coordinate mapping, and state machine tra
 
 | Variable | Default | Purpose |
 |---|---|---|
+| `BUDDY_TTS_BACKEND` | `kokoro` | TTS backend — `kokoro` (higher quality, ~2s first-audio latency) or `piper` (faster, ~300ms first-audio, slightly robotic voice). |
 | `BUDDY_MIC_DEVICE` | auto-detects `pipewire` | Override which sounddevice input to use. Can be an integer index or a case-insensitive substring of the device name (e.g. `BUDDY_MIC_DEVICE=4` or `BUDDY_MIC_DEVICE=pipewire`). List devices with `python3 -c 'import sounddevice as sd; print(sd.query_devices())'`. |
+| `BUDDY_CAPTURE_MODE` | `auto` | Screenshot strategy. `auto` crops to the active window (better detail); set to `monitor` to force full-monitor capture across all displays. |
+| `BUDDY_SCREENSHOT_MAX_EDGE` | `800` | Max long-edge pixels for the JPEG sent to Claude. 800 is the sweet spot for the `claude -p` CLI's auto-downsize; larger values get crushed further. |
 | `BUDDY_WHISPER_MODEL` | `base.en` | Swap the whisper model — try `tiny.en` if you're low on RAM or `small.en` if you want better accuracy. |
 | `BUDDY_WHISPER_DEVICE` | `cpu` | Set to `cuda` if you have an NVIDIA GPU and `faster-whisper` picks it up. |
 | `BUDDY_WHISPER_COMPUTE` | `int8` | Whisper compute type. Use `float16` on GPU for speed. |
