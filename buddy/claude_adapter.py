@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import re
 import subprocess
+import threading
 from dataclasses import dataclass
 from typing import Sequence
 
@@ -26,6 +27,10 @@ from buddy import config
 POINT_REGEX = re.compile(
     r"\[POINT:(?:none|(\d+)\s*,\s*(\d+)(?::([^\]:\s][^\]:]*?))?(?::screen(\d+))?)\]\s*$"
 )
+
+
+class ClaudeCancelled(Exception):
+    """Raised when an in-flight claude -p call is interrupted by cancel()."""
 
 
 @dataclass
@@ -142,6 +147,11 @@ class ClaudeAdapter:
         self._timeout = timeout_seconds
         # [(user_transcript, assistant_spoken_text), ...]
         self._history: list[tuple[str, str]] = []
+        # In-flight subprocess so cancel() can kill it from the hotkey
+        # handler when the user interrupts mid-turn.
+        self._current_proc: subprocess.Popen | None = None
+        self._proc_lock = threading.Lock()
+        self._cancelled = threading.Event()
 
     # ── history ──────────────────────────────────────────────────────
 
@@ -194,7 +204,11 @@ class ClaudeAdapter:
         transcript: str,
         captures: Sequence[ScreenCapture] = (),
     ) -> ParsedResponse:
-        """Send one turn to Claude. Blocks until the subprocess returns.
+        """Send one turn to Claude. Blocks until the subprocess returns
+        or `cancel()` is called on another thread.
+
+        Raises RuntimeError on nonzero exit code, TimeoutError on hard
+        timeout, and ClaudeCancelled when interrupted mid-flight.
 
         Must be called from a worker thread, not the GTK main thread.
         """
@@ -210,20 +224,41 @@ class ClaudeAdapter:
         ]
 
         print(f"🤖 claude: asking ({self.model}, {len(captures)} images, {len(self._history)} history)")
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=self._timeout,
-        )
 
-        if result.returncode != 0:
-            stderr = (result.stderr or "").strip()
+        # Reset the cancel flag so a previous cancel doesn't affect us.
+        self._cancelled.clear()
+
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        with self._proc_lock:
+            self._current_proc = proc
+
+        try:
+            try:
+                stdout, stderr = proc.communicate(timeout=self._timeout)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait(timeout=2.0)
+                raise TimeoutError(
+                    f"claude subprocess exceeded {self._timeout}s timeout"
+                )
+        finally:
+            with self._proc_lock:
+                self._current_proc = None
+
+        if self._cancelled.is_set():
+            raise ClaudeCancelled("claude call was interrupted by the user")
+
+        if proc.returncode != 0:
             raise RuntimeError(
-                stderr or f"claude exited with code {result.returncode}"
+                (stderr or "").strip() or f"claude exited with code {proc.returncode}"
             )
 
-        raw_text = _scrub_cli_artifacts(result.stdout)
+        raw_text = _scrub_cli_artifacts(stdout)
         parsed = parse_point(raw_text)
 
         # Save to history using the stripped spoken text (no POINT tag).
@@ -232,3 +267,19 @@ class ClaudeAdapter:
             self._history = self._history[-self._max_history:]
 
         return parsed
+
+    def cancel(self) -> None:
+        """Kill any in-flight `claude -p` subprocess. Safe from any thread.
+
+        Sets an internal flag so the ask() call can distinguish a
+        user-triggered cancellation from a normal subprocess failure,
+        and raise ClaudeCancelled instead of RuntimeError.
+        """
+        self._cancelled.set()
+        with self._proc_lock:
+            proc = self._current_proc
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.kill()
+            except Exception:
+                pass

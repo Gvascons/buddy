@@ -179,22 +179,30 @@ class BuddyApp:
         GLib.idle_add(self._handle_hotkey_release)
 
     def _handle_hotkey_press(self) -> bool:
-        """Main thread: start recording."""
+        """Main thread: start recording.
+
+        Also handles interrupts: if the user presses the hotkey while
+        buddy is already in PROCESSING or RESPONDING, this cancels
+        whatever's running (the claude subprocess and/or TTS) and
+        transitions back to IDLE before starting a fresh recording.
+        """
         if self.whisper is None:
             if self.control_panel:
                 self.control_panel._set_status_label("still loading whisper… wait a sec")
             return False
 
-        # Cancel any in-flight TTS and transient hide
+        # Cancel any in-flight TTS, pending hide, and (if claude is
+        # still thinking) the claude subprocess itself.
         self.tts.stop()
+        self.claude.cancel()
         self._cancel_transient_hide()
 
-        # If the user interrupts a RESPONDING turn, force back to IDLE first
-        # so the allowed-edge check lets us enter LISTENING.
-        if self.state.state == VoiceState.RESPONDING:
-            self.state.force(VoiceState.IDLE)
+        # Whatever state we were in, force back to IDLE so the allowed-
+        # edge check below lets us enter LISTENING. The old worker
+        # thread (if any) will see its state has moved on when it
+        # tries to post a result back, and will drop it.
         if self.state.state != VoiceState.IDLE:
-            return False
+            self.state.force(VoiceState.IDLE)
 
         # Show the overlay if in transient mode
         if self.overlay is not None:
@@ -241,11 +249,20 @@ class BuddyApp:
     # ────────────────────────────────────────────────────────────────
 
     def _pipeline_worker(self, pcm_bytes: bytes) -> None:
+        """Runs on a daemon worker thread. Each turn gets its own
+        worker, and if the user interrupts mid-turn the worker simply
+        discovers (either via a ClaudeCancelled exception or a state
+        check) that its work is no longer wanted and bails out.
+        """
+        from buddy.claude_adapter import ClaudeCancelled
         try:
             assert self.whisper is not None
 
             # 1. Transcribe
             transcript = self.whisper.transcribe(pcm_bytes)
+            if not self._worker_still_wanted():
+                print("⚠️ pipeline: cancelled after whisper")
+                return
             if not transcript:
                 print("⚠️ whisper: empty transcript")
                 GLib.idle_add(self._fail_and_reset, "didn't catch that — try again")
@@ -258,6 +275,9 @@ class BuddyApp:
             time.sleep(0.05)
             captures = capture_for_prompt(self.monitors)
             self._restore_overlay_after_capture()
+            if not self._worker_still_wanted():
+                print("⚠️ pipeline: cancelled after screenshot")
+                return
 
             # 3. Ask Claude
             parsed = self.claude.ask(transcript, captures)
@@ -268,11 +288,27 @@ class BuddyApp:
                     f"{parsed.label} screen={parsed.screen_number}"
                 )
 
+            if not self._worker_still_wanted():
+                print("⚠️ pipeline: cancelled after claude")
+                return
+
             # 4. Trigger cursor + TTS on main thread
             GLib.idle_add(self._handle_response, parsed, captures)
+        except ClaudeCancelled:
+            # User hit the hotkey mid-turn — this is expected, not an error.
+            print("⚠️ pipeline: claude call cancelled by user")
         except Exception as exc:
             print(f"⚠️ pipeline: {exc}")
-            GLib.idle_add(self._fail_and_reset, str(exc))
+            if self._worker_still_wanted():
+                GLib.idle_add(self._fail_and_reset, str(exc))
+
+    def _worker_still_wanted(self) -> bool:
+        """True if the currently-running pipeline worker should keep
+        going. If the user pressed the hotkey again mid-turn, the
+        state machine will have been forced back to IDLE / LISTENING
+        and any in-flight worker thread should drop its result.
+        """
+        return self.state.state == VoiceState.PROCESSING
 
     def _hide_overlay_for_capture(self) -> None:
         """Hide overlay synchronously so the next ffmpeg grab is clean."""
