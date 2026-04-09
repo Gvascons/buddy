@@ -39,7 +39,7 @@ from buddy.screenshot import (
 )
 from buddy.state_machine import StateMachine, VoiceState
 from buddy.stt_whisper import WhisperSTT
-from buddy.tts_piper import PiperTTS
+from buddy.tts import make_tts
 
 
 class BuddyApp:
@@ -51,7 +51,7 @@ class BuddyApp:
         self.state = StateMachine()
         self.recorder = AudioRecorder()
         self.claude = ClaudeAdapter()
-        self.tts = PiperTTS()
+        self.tts = make_tts()
         self.whisper: WhisperSTT | None = None
         self.monitors = enumerate_monitors()
 
